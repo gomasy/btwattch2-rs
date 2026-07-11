@@ -15,11 +15,17 @@ struct MackerelCli {
     /// Specify the metric name.
     #[arg(long, value_name = "name")]
     metric_name: String,
+
+    /// Print informational messages to stderr.
+    #[arg(short, long)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = MackerelCli::parse();
+    btwattch2::log::set_debug(args.debug);
+
     let mut conn = Connection::new(&args.connect).await?;
 
     conn.subscribe_measure(|m| {

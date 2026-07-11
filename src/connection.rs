@@ -87,7 +87,7 @@ impl Connection {
             return Ok(device);
         }
 
-        eprintln!("[INFO] Scanning for {addr}...");
+        crate::info!("Scanning for {addr}...");
         adapter
             .start_scan(ScanFilter::default())
             .await
@@ -123,8 +123,10 @@ impl Connection {
         name: &str,
     ) -> Result<(Characteristic, Characteristic)> {
         for attempt in 1.. {
-            eprint!("[INFO] Connecting to {addr} via {name}...");
-            std::io::stderr().flush().ok();
+            if crate::log::enabled() {
+                eprint!("[INFO] Connecting to {addr} via {name}...");
+                std::io::stderr().flush().ok();
+            }
 
             let result = async {
                 device.connect().await?;
@@ -135,7 +137,9 @@ impl Connection {
             match result {
                 Ok(()) => break,
                 Err(e) if attempt < CONNECT_RETRIES => {
-                    eprintln!(" failed: {e}, retrying...");
+                    if crate::log::enabled() {
+                        eprintln!(" failed: {e}, retrying...");
+                    }
                     // On BlueZ, Connect() can succeed at the D-Bus level even
                     // when service discovery times out, leaving a half-open
                     // connection that makes every later attempt fail too.
@@ -144,7 +148,9 @@ impl Connection {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    eprintln!(" failed");
+                    if crate::log::enabled() {
+                        eprintln!(" failed");
+                    }
                     device.disconnect().await.ok();
                     return Err(e)
                         .with_context(|| format!("connect failed after {attempt} attempts"));
@@ -163,7 +169,9 @@ impl Connection {
         let tx = find(C_TX)?;
         let rx = find(C_RX)?;
 
-        eprintln!(" done");
+        if crate::log::enabled() {
+            eprintln!(" done");
+        }
         Ok((tx, rx))
     }
 
@@ -176,14 +184,14 @@ impl Connection {
 
     pub async fn disconnect(&self) -> Result<()> {
         self.device.disconnect().await?;
-        eprintln!("[INFO] Disconnected");
+        crate::info!("Disconnected");
         Ok(())
     }
 
     pub async fn set_rtc(&mut self, time: &DateTime<Local>) -> Result<()> {
         self.subscribe(payload::rtc(time), |frame| {
             if succeeded(frame) {
-                eprintln!("[INFO] RTC set succeeded");
+                crate::info!("RTC set succeeded");
             }
             ControlFlow::Break(())
         })
@@ -271,7 +279,7 @@ impl Connection {
 
         self.subscribe(payload, |frame| {
             if frame.get(4) == Some(&0x00) && frame.get(5) == Some(&expected) {
-                eprintln!("[INFO] Power {op} succeeded");
+                crate::info!("Power {op} succeeded");
             } else if let Some(code) = frame.get(4) {
                 eprintln!("[ERR] Power {op} failed, CODE: {code:#04x}");
             } else {
@@ -285,7 +293,7 @@ impl Connection {
     pub async fn blink_led(&mut self) -> Result<()> {
         self.subscribe(payload::blink_led(), |frame| {
             if succeeded(frame) {
-                eprintln!("[INFO] Blink succeeded");
+                crate::info!("Blink succeeded");
             }
             ControlFlow::Break(())
         })

@@ -74,6 +74,8 @@ wattchecker1.ampere     1.120739296078682       1609304963
 wattchecker1.wattage    104.89565205574036      1609304963
 ```
 
+Unlike `btwattch2`, the `mackerel` binary suppresses informational (`[INFO]`) messages on stderr so that it stays quiet when invoked from mackerel-agent. Pass `-d` / `--debug` to print them for troubleshooting.
+
 Note: The epoch of the metrics is based on the RTC of the device. Synchronize the RTC periodically. (See "Time synchronization" above.)
 
 ## License

@@ -7,6 +7,8 @@ use btwattch2::connection::Connection;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    btwattch2::log::set_debug(true);
+
     let mut conn = Connection::new(&cli.connect).await?;
 
     tokio::select! {
