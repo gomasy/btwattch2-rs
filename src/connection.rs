@@ -25,6 +25,7 @@ const HEADER: u8 = 0xAA;
 const FRAME_OVERHEAD: usize = 4;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_RETRIES: usize = 5;
+const CONNECT_RETRIES: usize = 5;
 
 const VOLTAGE_SCALE: f64 = (1u64 << 24) as f64;
 const AMPERE_SCALE: f64 = (1u64 << 30) as f64;
@@ -121,11 +122,35 @@ impl Connection {
         addr: BDAddr,
         name: &str,
     ) -> Result<(Characteristic, Characteristic)> {
-        eprint!("[INFO] Connecting to {addr} via {name}...");
-        std::io::stderr().flush().ok();
+        for attempt in 1.. {
+            eprint!("[INFO] Connecting to {addr} via {name}...");
+            std::io::stderr().flush().ok();
 
-        device.connect().await?;
-        device.discover_services().await?;
+            let result = async {
+                device.connect().await?;
+                device.discover_services().await
+            }
+            .await;
+
+            match result {
+                Ok(()) => break,
+                Err(e) if attempt < CONNECT_RETRIES => {
+                    eprintln!(" failed: {e}, retrying...");
+                    // On BlueZ, Connect() can succeed at the D-Bus level even
+                    // when service discovery times out, leaving a half-open
+                    // connection that makes every later attempt fail too.
+                    // Drop it before retrying.
+                    device.disconnect().await.ok();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    eprintln!(" failed");
+                    device.disconnect().await.ok();
+                    return Err(e)
+                        .with_context(|| format!("connect failed after {attempt} attempts"));
+                }
+            }
+        }
 
         let chars = device.characteristics();
         let find = |uuid: Uuid| {
