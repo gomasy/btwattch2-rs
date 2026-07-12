@@ -44,6 +44,15 @@ pub struct Cli {
     /// Blink the LED on the main unit.
     #[arg(long)]
     pub test_led: bool,
+
+    /// Print a single measurement as Mackerel custom metrics and exit.
+    #[arg(long, value_name = "name")]
+    pub metric_name: Option<String>,
+
+    /// Print informational messages to stderr (suppressed by default when
+    /// --metric-name is given).
+    #[arg(short, long)]
+    pub debug: bool,
 }
 
 impl Cli {

@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -7,7 +9,9 @@ use btwattch2::connection::Connection;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    btwattch2::log::set_debug(true);
+    // Stay quiet in Mackerel mode unless --debug is given, so nothing but
+    // metrics reaches mackerel-agent.
+    btwattch2::log::set_debug(cli.debug || cli.metric_name.is_none());
 
     let mut conn = Connection::new(&cli.connect).await?;
 
@@ -28,6 +32,17 @@ async fn run(conn: &mut Connection, cli: &Cli) -> Result<()> {
         conn.power(false).await
     } else if cli.test_led {
         conn.blink_led().await
+    } else if let Some(metric_name) = &cli.metric_name {
+        conn.subscribe_measure(|m| {
+            let epoch = m.timestamp.timestamp();
+
+            println!("{metric_name}.voltage\t{}\t{epoch}", m.voltage);
+            println!("{metric_name}.ampere\t{}\t{epoch}", m.ampere);
+            println!("{metric_name}.wattage\t{}\t{epoch}", m.wattage);
+
+            ControlFlow::Break(())
+        })
+        .await
     } else {
         conn.measure().await
     }

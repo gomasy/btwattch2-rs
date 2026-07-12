@@ -28,14 +28,13 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build
         run: cargo build --release --locked
-      - name: Package
-        run: |
-          tar -C target/release -czf "btwattch2-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" btwattch2 mackerel
+      - name: Rename binary
+        run: cp target/release/btwattch2 "btwattch2-${GITHUB_REF_NAME}-${{ matrix.target }}"
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
-          path: '*.tar.gz'
+          path: btwattch2-*-${{ matrix.target }}
           if-no-files-found: error
           retention-days: 1
 
@@ -54,5 +53,5 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ runner.temp }}/binaries/*.tar.gz
+          files: ${{ runner.temp }}/binaries/*
           generate_release_notes: true

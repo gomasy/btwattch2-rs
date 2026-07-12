@@ -17,7 +17,7 @@ This is a Rust port of [ruby-btwattch2](https://github.com/gomasy/ruby-btwattch2
 $ cargo build --release
 ```
 
-Two binaries, `btwattch2` and `mackerel`, are generated in `target/release/`.
+A single binary, `btwattch2`, is generated in `target/release/`.
 
 ## Usage
 
@@ -33,6 +33,8 @@ Options:
       --set-rtc <time>        Specify the time to set to RTC
       --set-rtc-now           Set the current time of this system to RTC
       --test-led              Blink the LED on the main unit
+      --metric-name <name>    Print a single measurement as Mackerel custom metrics and exit
+  -d, --debug                 Print informational messages to stderr (suppressed by default when --metric-name is given)
   -h, --help                  Print help
 ```
 
@@ -68,13 +70,13 @@ Timestamps of the measurements are based on the RTC of the device, so run the fo
 Measurements can also be printed in a format compliant with [Mackerel](https://mackerel.io) custom metrics.
 
 ```console
-# mackerel --addr CB:DF:6B:12:34:56 --metric-name wattchecker1
+# btwattch2 --addr CB:DF:6B:12:34:56 --metric-name wattchecker1
 wattchecker1.voltage    104.80763912200928      1609304963
 wattchecker1.ampere     1.120739296078682       1609304963
 wattchecker1.wattage    104.89565205574036      1609304963
 ```
 
-Unlike `btwattch2`, the `mackerel` binary suppresses informational (`[INFO]`) messages on stderr so that it stays quiet when invoked from mackerel-agent. Pass `-d` / `--debug` to print them for troubleshooting.
+When `--metric-name` is given, informational (`[INFO]`) messages on stderr are suppressed so that the output stays quiet when invoked from mackerel-agent. Pass `-d` / `--debug` to print them for troubleshooting.
 
 Note: The epoch of the metrics is based on the RTC of the device. Synchronize the RTC periodically. (See "Time synchronization" above.)
 
