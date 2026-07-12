@@ -3,7 +3,7 @@ use btleplug::api::BDAddr;
 use chrono::{DateTime, Local, NaiveDateTime, TimeDelta, TimeZone};
 use clap::{Args, Parser};
 
-/// Options shared by every binary that talks to the device.
+/// Options needed to reach the device, whatever the mode.
 #[derive(Args, Debug)]
 pub struct ConnectOpts {
     /// Specify adapter index, e.g. hci0.
@@ -26,27 +26,27 @@ pub struct Cli {
     pub connect: ConnectOpts,
 
     /// Turn on the power switch.
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     pub on: bool,
 
     /// Turn off the power switch.
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     pub off: bool,
 
     /// Specify the time to set to RTC.
-    #[arg(long, value_name = "time", value_parser = parse_time)]
+    #[arg(long, value_name = "time", value_parser = parse_time, group = "mode")]
     pub set_rtc: Option<DateTime<Local>>,
 
     /// Set the current time of this system to RTC.
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     pub set_rtc_now: bool,
 
     /// Blink the LED on the main unit.
-    #[arg(long)]
+    #[arg(long, group = "mode")]
     pub test_led: bool,
 
     /// Print a single measurement as Mackerel custom metrics and exit.
-    #[arg(long, value_name = "name")]
+    #[arg(long, value_name = "name", group = "mode")]
     pub metric_name: Option<String>,
 
     /// Print informational messages to stderr (suppressed by default when
