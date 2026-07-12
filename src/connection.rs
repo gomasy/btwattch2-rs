@@ -144,14 +144,14 @@ impl Connection {
                     // when service discovery times out, leaving a half-open
                     // connection that makes every later attempt fail too.
                     // Drop it before retrying.
-                    device.disconnect().await.ok();
+                    Self::drop_connection(device).await;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
                     if crate::log::enabled() {
                         eprintln!(" failed");
                     }
-                    device.disconnect().await.ok();
+                    Self::drop_connection(device).await;
                     return Err(e)
                         .with_context(|| format!("connect failed after {attempt} attempts"));
                 }
@@ -183,9 +183,18 @@ impl Connection {
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        self.device.disconnect().await?;
+        Self::drop_connection(&self.device).await;
         crate::info!("Disconnected");
         Ok(())
+    }
+
+    /// Disconnect only if a link is actually established. Calling
+    /// Disconnect() while a connect attempt is still in flight aborts it,
+    /// which makes bluetoothd log "No matching connection for device".
+    async fn drop_connection(device: &Peripheral) {
+        if device.is_connected().await.unwrap_or(false) {
+            device.disconnect().await.ok();
+        }
     }
 
     pub async fn set_rtc(&mut self, time: &DateTime<Local>) -> Result<()> {
