@@ -55,12 +55,33 @@ pub struct Cli {
     pub debug: bool,
 }
 
+/// What the invocation asks the tool to do. The clap `mode` group
+/// guarantees at most one of the flags below is set.
+#[derive(Debug)]
+pub enum Mode {
+    SetRtc(DateTime<Local>),
+    Power(bool),
+    TestLed,
+    Metric(String),
+    Monitor,
+}
+
 impl Cli {
-    pub fn rtc_time(&self) -> Option<DateTime<Local>> {
+    pub fn mode(&self) -> Mode {
         if self.set_rtc_now {
-            Some(Local::now())
+            Mode::SetRtc(Local::now())
+        } else if let Some(time) = self.set_rtc {
+            Mode::SetRtc(time)
+        } else if self.on {
+            Mode::Power(true)
+        } else if self.off {
+            Mode::Power(false)
+        } else if self.test_led {
+            Mode::TestLed
+        } else if let Some(name) = &self.metric_name {
+            Mode::Metric(name.clone())
         } else {
-            self.set_rtc
+            Mode::Monitor
         }
     }
 }

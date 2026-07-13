@@ -1,8 +1,10 @@
 use chrono::{DateTime, Datelike, Local, Timelike};
 
-use crate::crc8::crc8;
+/// Every frame, in both directions, starts with this byte.
+pub const HEADER: u8 = 0xAA;
+/// Length of the header (1) + size field (2) + CRC (1).
+pub const FRAME_OVERHEAD: usize = 4;
 
-const CMD_HEADER: u8 = 0xAA;
 const RTC_TIMER: u8 = 0x01;
 const MONITORING: u8 = 0x08;
 const TURN_OFF: [u8; 2] = [0xA7, 0x00];
@@ -39,12 +41,30 @@ pub fn blink_led() -> Vec<u8> {
 }
 
 fn generate(payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(payload.len() + 4);
-    frame.push(CMD_HEADER);
+    let mut frame = Vec::with_capacity(payload.len() + FRAME_OVERHEAD);
+    frame.push(HEADER);
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
     frame.push(crc8(payload));
     frame
+}
+
+/// CRC-8 over the payload bytes, as the device expects: polynomial 0x85,
+/// zero initial value, no reflection. Not any catalogued standard variant.
+fn crc8(payload: &[u8]) -> u8 {
+    const POLYNOMIAL: u8 = 0x85;
+
+    payload.iter().fold(0x00, |mut crc, &byte| {
+        crc ^= byte;
+        for _ in 0..8 {
+            crc = if crc & 0x80 == 0x80 {
+                (crc << 1) ^ POLYNOMIAL
+            } else {
+                crc << 1
+            };
+        }
+        crc
+    })
 }
 
 #[cfg(test)]
@@ -55,6 +75,16 @@ mod tests {
     #[test]
     fn monitoring_frame() {
         assert_eq!(monitoring(), vec![0xAA, 0x00, 0x01, 0x08, 0xB3]);
+    }
+
+    #[test]
+    fn crc8_of_monitoring_command() {
+        assert_eq!(crc8(&[0x08]), 0xB3);
+    }
+
+    #[test]
+    fn crc8_of_empty_payload() {
+        assert_eq!(crc8(&[]), 0x00);
     }
 
     #[test]

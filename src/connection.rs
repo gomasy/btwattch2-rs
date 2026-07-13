@@ -1,6 +1,7 @@
 use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,15 +15,12 @@ use futures::{Stream, StreamExt};
 use uuid::{Uuid, uuid};
 
 use crate::cli::{ConnectOpts, local_datetime};
-use crate::payload;
+use crate::payload::{self, FRAME_OVERHEAD, HEADER};
 
-pub const SERVICE: Uuid = uuid!("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
-pub const C_TX: Uuid = uuid!("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
-pub const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+// TX/RX characteristics of the Nordic UART service the device exposes.
+const C_TX: Uuid = uuid!("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
+const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
 
-const HEADER: u8 = 0xAA;
-// Length of the header (1) + size field (2) + CRC (1)
-const FRAME_OVERHEAD: usize = 4;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_RETRIES: usize = 5;
 const CONNECT_RETRIES: usize = 5;
@@ -33,7 +31,28 @@ const WATTAGE_SCALE: f64 = (1u64 << 24) as f64;
 
 type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
 
-#[derive(Debug, Clone)]
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Enable informational output. Called once at startup from the CLI flag.
+pub fn set_debug(enabled: bool) {
+    DEBUG.store(enabled, Ordering::Relaxed);
+}
+
+fn enabled() -> bool {
+    DEBUG.load(Ordering::Relaxed)
+}
+
+// Print an informational message to stderr, only when --debug is on.
+// Warnings and errors are printed unconditionally with plain `eprintln!`.
+macro_rules! info {
+    ($($arg:tt)*) => {
+        if enabled() {
+            eprintln!("[INFO] {}", format_args!($($arg)*));
+        }
+    };
+}
+
+#[derive(Debug)]
 pub struct Measurement {
     pub voltage: f64,
     pub ampere: f64,
@@ -87,7 +106,7 @@ impl Connection {
             return Ok(device);
         }
 
-        crate::info!("Scanning for {addr}...");
+        info!("Scanning for {addr}...");
         adapter
             .start_scan(ScanFilter::default())
             .await
@@ -123,7 +142,7 @@ impl Connection {
         name: &str,
     ) -> Result<(Characteristic, Characteristic)> {
         for attempt in 1.. {
-            if crate::log::enabled() {
+            if enabled() {
                 eprint!("[INFO] Connecting to {addr} via {name}...");
                 std::io::stderr().flush().ok();
             }
@@ -137,7 +156,7 @@ impl Connection {
             match result {
                 Ok(()) => break,
                 Err(e) if attempt < CONNECT_RETRIES => {
-                    if crate::log::enabled() {
+                    if enabled() {
                         eprintln!(" failed: {e}, retrying...");
                     }
                     // On BlueZ, Connect() can succeed at the D-Bus level even
@@ -148,7 +167,7 @@ impl Connection {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    if crate::log::enabled() {
+                    if enabled() {
                         eprintln!(" failed");
                     }
                     Self::drop_connection(device).await;
@@ -169,13 +188,13 @@ impl Connection {
         let tx = find(C_TX)?;
         let rx = find(C_RX)?;
 
-        if crate::log::enabled() {
+        if enabled() {
             eprintln!(" done");
         }
         Ok((tx, rx))
     }
 
-    pub async fn connect(&mut self) -> Result<()> {
+    async fn connect(&mut self) -> Result<()> {
         let (tx, rx) = Self::establish(&self.device, self.addr, &self.name).await?;
         self.tx = tx;
         self.rx = rx;
@@ -184,7 +203,7 @@ impl Connection {
 
     pub async fn disconnect(&self) -> Result<()> {
         Self::drop_connection(&self.device).await;
-        crate::info!("Disconnected");
+        info!("Disconnected");
         Ok(())
     }
 
@@ -198,16 +217,36 @@ impl Connection {
     }
 
     pub async fn set_rtc(&mut self, time: &DateTime<Local>) -> Result<()> {
-        self.subscribe(payload::rtc(time), |frame| {
-            if succeeded(frame) {
-                crate::info!("RTC set succeeded");
+        self.command(payload::rtc(time), "RTC set").await
+    }
+
+    pub async fn power(&mut self, on: bool) -> Result<()> {
+        let (payload, action) = if on {
+            (payload::on(), "Power on")
+        } else {
+            (payload::off(), "Power off")
+        };
+        self.command(payload, action).await
+    }
+
+    pub async fn blink_led(&mut self) -> Result<()> {
+        self.command(payload::blink_led(), "Blink").await
+    }
+
+    /// Send a one-shot command and report the status byte of the reply.
+    async fn command(&mut self, payload: Vec<u8>, action: &str) -> Result<()> {
+        self.subscribe(payload, |frame| {
+            match frame.get(4).copied() {
+                Some(0x00) => info!("{action} succeeded"),
+                Some(code) => eprintln!("[ERR] {action} failed, CODE: {code:#04x}"),
+                None => eprintln!("[ERR] {action} failed, frame too short"),
             }
             ControlFlow::Break(())
         })
         .await
     }
 
-    pub async fn subscribe<F>(&mut self, payload: Vec<u8>, mut on_frame: F) -> Result<()>
+    async fn subscribe<F>(&mut self, payload: Vec<u8>, mut on_frame: F) -> Result<()>
     where
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
@@ -271,44 +310,6 @@ impl Connection {
         .await
     }
 
-    pub async fn measure(&mut self) -> Result<()> {
-        self.subscribe_measure(|m| {
-            println!("V = {}, A = {}, W = {}", m.voltage, m.ampere, m.wattage);
-            ControlFlow::Continue(())
-        })
-        .await
-    }
-
-    pub async fn power(&mut self, on: bool) -> Result<()> {
-        let (payload, op, expected) = if on {
-            (payload::on(), "on", 0x01)
-        } else {
-            (payload::off(), "off", 0x00)
-        };
-
-        self.subscribe(payload, |frame| {
-            if frame.get(4) == Some(&0x00) && frame.get(5) == Some(&expected) {
-                crate::info!("Power {op} succeeded");
-            } else if let Some(code) = frame.get(4) {
-                eprintln!("[ERR] Power {op} failed, CODE: {code:#04x}");
-            } else {
-                eprintln!("[ERR] Power {op} failed, frame too short");
-            }
-            ControlFlow::Break(())
-        })
-        .await
-    }
-
-    pub async fn blink_led(&mut self) -> Result<()> {
-        self.subscribe(payload::blink_led(), |frame| {
-            if succeeded(frame) {
-                crate::info!("Blink succeeded");
-            }
-            ControlFlow::Break(())
-        })
-        .await
-    }
-
     async fn listen(&self) -> Result<Notifications> {
         self.device.subscribe(&self.rx).await?;
         Ok(self.device.notifications().await?)
@@ -320,6 +321,7 @@ impl Connection {
         let mut reconnected = false;
 
         for attempt in 1.. {
+            // Re-read every attempt: a reconnect along the way replaces `tx`.
             let write_type = if self.tx.properties.contains(CharPropFlags::WRITE) {
                 WriteType::WithResponse
             } else {
@@ -347,10 +349,6 @@ impl Connection {
 
         unreachable!()
     }
-}
-
-fn succeeded(frame: &[u8]) -> bool {
-    frame.get(4) == Some(&0x00)
 }
 
 fn read_measure(frame: &[u8]) -> Result<Measurement> {
