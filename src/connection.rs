@@ -1,4 +1,3 @@
-use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,10 +141,7 @@ impl Connection {
         name: &str,
     ) -> Result<(Characteristic, Characteristic)> {
         for attempt in 1.. {
-            if enabled() {
-                eprint!("[INFO] Connecting to {addr} via {name}...");
-                std::io::stderr().flush().ok();
-            }
+            info!("Connecting to {addr} via {name} (attempt {attempt})...");
 
             let result = async {
                 device.connect().await?;
@@ -156,9 +152,7 @@ impl Connection {
             match result {
                 Ok(()) => break,
                 Err(e) if attempt < CONNECT_RETRIES => {
-                    if enabled() {
-                        eprintln!(" failed: {e}, retrying...");
-                    }
+                    info!("Connection failed: {e}, retrying...");
                     // On BlueZ, Connect() can succeed at the D-Bus level even
                     // when service discovery times out, leaving a half-open
                     // connection that makes every later attempt fail too.
@@ -167,9 +161,7 @@ impl Connection {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    if enabled() {
-                        eprintln!(" failed");
-                    }
+                    info!("Connection failed: {e}");
                     Self::drop_connection(device).await;
                     return Err(e)
                         .with_context(|| format!("connect failed after {attempt} attempts"));
@@ -188,9 +180,7 @@ impl Connection {
         let tx = find(C_TX)?;
         let rx = find(C_RX)?;
 
-        if enabled() {
-            eprintln!(" done");
-        }
+        info!("Connected to {addr} via {name}");
         Ok((tx, rx))
     }
 
@@ -282,10 +272,11 @@ impl Connection {
                     }
                     buf.extend_from_slice(&event.value);
 
-                    if buf.len() >= FRAME_OVERHEAD
-                        && buf.len() - FRAME_OVERHEAD
-                            == u16::from_be_bytes([buf[1], buf[2]]) as usize
-                    {
+                    if buf.len() >= FRAME_OVERHEAD {
+                        let payload_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+                        if buf.len() - FRAME_OVERHEAD != payload_len {
+                            continue;
+                        }
                         if on_frame(&buf).is_break() {
                             return Ok(());
                         }
@@ -365,14 +356,14 @@ fn read_measure(frame: &[u8]) -> Result<Measurement> {
             .ok_or_else(|| anyhow!("invalid timestamp in frame"))?;
 
     Ok(Measurement {
-        voltage: ulong(&frame[5..11]) as f64 / VOLTAGE_SCALE,
-        ampere: ulong(&frame[11..17]) as f64 / AMPERE_SCALE,
-        wattage: ulong(&frame[17..23]) as f64 / WATTAGE_SCALE,
+        voltage: u48_le(&frame[5..11]) as f64 / VOLTAGE_SCALE,
+        ampere: u48_le(&frame[11..17]) as f64 / AMPERE_SCALE,
+        wattage: u48_le(&frame[17..23]) as f64 / WATTAGE_SCALE,
         timestamp,
     })
 }
 
-fn ulong(payload: &[u8]) -> u64 {
+fn u48_le(payload: &[u8]) -> u64 {
     payload
         .iter()
         .rev()
@@ -385,9 +376,9 @@ mod tests {
     use chrono::{Datelike, Timelike};
 
     #[test]
-    fn ulong_is_little_endian() {
-        assert_eq!(ulong(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]), 1);
-        assert_eq!(ulong(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]), 1 << 40);
+    fn u48_le_is_little_endian() {
+        assert_eq!(u48_le(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]), 1);
+        assert_eq!(u48_le(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]), 1 << 40);
     }
 
     #[test]
