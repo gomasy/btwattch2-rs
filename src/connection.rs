@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use chrono::{DateTime, Local, NaiveDate};
 use futures::{Stream, StreamExt};
 use uuid::{Uuid, uuid};
 
-use crate::cli::{ConnectOpts, local_datetime};
+use crate::cli::{ConnectionConfig, LogLevel, local_datetime};
 use crate::payload::{self, FRAME_OVERHEAD, HEADER};
 
 // TX/RX characteristics of the Nordic UART service the device exposes.
@@ -30,22 +31,23 @@ const WATTAGE_SCALE: f64 = (1u64 << 24) as f64;
 
 type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
 
-static DEBUG: AtomicBool = AtomicBool::new(false);
+static INFO: AtomicBool = AtomicBool::new(false);
 
-/// Enable informational output. Called once at startup from the CLI flag.
-pub fn set_debug(enabled: bool) {
-    DEBUG.store(enabled, Ordering::Relaxed);
+/// Set the verbosity of informational (`[INFO]`) output. Called once at
+/// startup from the resolved CLI log level.
+pub fn set_log_level(level: LogLevel) {
+    INFO.store(level == LogLevel::Info, Ordering::Relaxed);
 }
 
-fn enabled() -> bool {
-    DEBUG.load(Ordering::Relaxed)
+fn info_enabled() -> bool {
+    INFO.load(Ordering::Relaxed)
 }
 
-// Print an informational message to stderr, only when --debug is on.
+// Print an informational message to stderr, only when --log-level allows it.
 // Warnings and errors are printed unconditionally with plain `eprintln!`.
 macro_rules! info {
     ($($arg:tt)*) => {
-        if enabled() {
+        if info_enabled() {
             eprintln!("[INFO] {}", format_args!($($arg)*));
         }
     };
@@ -56,7 +58,18 @@ pub struct Measurement {
     pub voltage: f64,
     pub ampere: f64,
     pub wattage: f64,
+    /// Power factor, derived as wattage / (voltage * ampere). The device does
+    /// not report this directly; 0.0 when voltage or ampere is zero.
+    pub power_factor: f64,
     pub timestamp: DateTime<Local>,
+}
+
+/// A device discovered during a scan.
+#[derive(Debug, Clone)]
+pub struct ScannedDevice {
+    pub addr: BDAddr,
+    pub name: Option<String>,
+    pub rssi: Option<i16>,
 }
 
 pub struct Connection {
@@ -69,7 +82,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub async fn new(opts: &ConnectOpts) -> Result<Self> {
+    pub async fn new(opts: &ConnectionConfig) -> Result<Self> {
         let manager = Manager::new().await?;
         let name = format!("hci{}", opts.index);
         let adapter = Self::find_adapter(&manager, &name).await?;
@@ -85,6 +98,52 @@ impl Connection {
             tx,
             rx,
         })
+    }
+
+    /// Scan for nearby Bluetooth devices for `duration` and return the unique
+    /// ones seen, keyed by address. Useful for discovering the device's BD
+    /// address before a first connection.
+    pub async fn scan(index: usize, duration: Duration) -> Result<Vec<ScannedDevice>> {
+        let manager = Manager::new().await?;
+        let name = format!("hci{index}");
+        let adapter = Self::find_adapter(&manager, &name).await?;
+
+        adapter
+            .start_scan(ScanFilter::default())
+            .await
+            .context("failed to start scanning (is Bluetooth powered on?)")?;
+
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut found: HashMap<BDAddr, ScannedDevice> = HashMap::new();
+        loop {
+            for dev in adapter.peripherals().await? {
+                let addr = dev.address();
+                // Advertisements are fragmented: the name often arrives in a
+                // later scan response, so keep polling properties (a D-Bus
+                // round trip) until a device has one, then leave it alone.
+                if found.get(&addr).is_some_and(|d| d.name.is_some()) {
+                    continue;
+                }
+                let Some(props) = dev.properties().await? else {
+                    continue;
+                };
+                found.insert(
+                    addr,
+                    ScannedDevice {
+                        addr,
+                        name: props.local_name,
+                        rssi: props.rssi,
+                    },
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        adapter.stop_scan().await.ok();
+        Ok(found.into_values().collect())
     }
 
     async fn find_adapter(manager: &Manager, name: &str) -> Result<Adapter> {
@@ -355,10 +414,20 @@ fn read_measure(frame: &[u8]) -> Result<Measurement> {
             .and_then(local_datetime)
             .ok_or_else(|| anyhow!("invalid timestamp in frame"))?;
 
+    let voltage = u48_le(&frame[5..11]) as f64 / VOLTAGE_SCALE;
+    let ampere = u48_le(&frame[11..17]) as f64 / AMPERE_SCALE;
+    let wattage = u48_le(&frame[17..23]) as f64 / WATTAGE_SCALE;
+    let power_factor = if voltage > 0.0 && ampere > 0.0 {
+        wattage / (voltage * ampere)
+    } else {
+        0.0
+    };
+
     Ok(Measurement {
-        voltage: u48_le(&frame[5..11]) as f64 / VOLTAGE_SCALE,
-        ampere: u48_le(&frame[11..17]) as f64 / AMPERE_SCALE,
-        wattage: u48_le(&frame[17..23]) as f64 / WATTAGE_SCALE,
+        voltage,
+        ampere,
+        wattage,
+        power_factor,
         timestamp,
     })
 }
@@ -398,6 +467,7 @@ mod tests {
         assert_eq!(m.voltage, 100.5);
         assert_eq!(m.ampere, 1.25);
         assert_eq!(m.wattage, 1.0);
+        assert!((m.power_factor - 1.0 / (100.5 * 1.25)).abs() < 1e-12);
         assert_eq!(
             (
                 m.timestamp.year(),
