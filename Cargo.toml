@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 btleplug = "0.12"
 chrono = "0.4.45"
 clap = { version = "4.6.2", features = ["derive"] }
