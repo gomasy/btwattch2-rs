@@ -299,6 +299,15 @@ impl Connection {
         Ok(())
     }
 
+    /// The RX notification stream ended: re-establish the link and return a
+    /// fresh subscription. The "stream closed, reconnecting" warning is emitted
+    /// here so it is logged exactly once, regardless of which caller drives it.
+    pub(crate) async fn reconnect_stream(&mut self) -> Result<Notifications> {
+        eprintln!("[WARN] Notification stream closed, reconnecting...");
+        self.connect().await?;
+        self.listen().await
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         Self::drop_connection(&self.device).await;
         info!("Disconnected");
@@ -365,9 +374,7 @@ impl Connection {
                 }
                 event = notifications.next() => {
                     let Some(event) = event else {
-                        eprintln!("[WARN] Notification stream closed, reconnecting...");
-                        self.connect().await?;
-                        notifications = self.listen().await?;
+                        notifications = self.reconnect_stream().await?;
                         assembler.clear();
                         continue;
                     };
@@ -390,11 +397,10 @@ impl Connection {
     where
         F: FnMut(Measurement) -> ControlFlow<()>,
     {
-        self.subscribe(payload::monitoring(), |frame| match read_measure(frame) {
-            Ok(m) => on_measure(m),
-            Err(e) => {
-                eprintln!("[ERR] Failed to parse measurement: {e}");
-                ControlFlow::Continue(())
+        self.subscribe(payload::monitoring(), |frame| {
+            match try_measurement(frame) {
+                Some(m) => on_measure(m),
+                None => ControlFlow::Continue(()),
             }
         })
         .await
@@ -470,6 +476,19 @@ pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
         power_factor,
         timestamp,
     })
+}
+
+/// Parse a reassembled frame into a measurement. On failure it logs the single
+/// "Failed to parse measurement" error and yields `None`, so callers can skip
+/// the frame and keep streaming instead of duplicating that log line.
+pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
+    match read_measure(frame) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!("[ERR] Failed to parse measurement: {e}");
+            None
+        }
+    }
 }
 
 fn u48_le(payload: &[u8]) -> u64 {

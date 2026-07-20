@@ -47,7 +47,6 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
             return Err(e);
         }
     };
-    eprintln!("[INFO] Connected to device");
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
     let shutdown = std::sync::Arc::new(Notify::new());
@@ -255,12 +254,17 @@ impl Actor {
         }
     }
 
+    /// Adopt a fresh notification stream, discarding any half-assembled frame.
+    fn apply_subscription(&mut self, n: Notifications) {
+        self.notifications = Some(n);
+        self.assembler.clear();
+    }
+
     /// (Re-)subscribe to RX notifications, discarding any half-assembled frame.
     async fn relisten(&mut self) -> Result<(), StreamError> {
         match self.conn.listen().await {
             Ok(n) => {
-                self.notifications = Some(n);
-                self.assembler.clear();
+                self.apply_subscription(n);
                 Ok(())
             }
             Err(e) => {
@@ -270,36 +274,40 @@ impl Actor {
         }
     }
 
-    /// Report a fatal stream error and tear the stream down. The next request
-    /// re-establishes it.
-    fn abort_stream(&mut self, e: StreamError) {
-        eprintln!("[ERR] {e}");
+    /// Tear the streaming state down. When `reason` is `Some`, it is logged as
+    /// an `[ERR]`; write failures are already logged by `Connection::write`, so
+    /// the agent passes `None` to avoid a duplicate line.
+    fn abort_stream(&mut self, reason: Option<StreamError>) {
+        if let Some(e) = reason {
+            eprintln!("[ERR] {e}");
+        }
         end_stream(&mut self.streaming_client);
         self.notifications = None;
     }
 
     /// Ask the device for a measurement. Only runs while a client is streaming.
     async fn poll_device(&mut self) {
-        let outcome = match self.conn.write(&self.monitoring_payload).await {
+        match self.conn.write(&self.monitoring_payload).await {
             // A reconnect along the way invalidated the old subscription.
-            Ok(true) => self.relisten().await,
-            Ok(false) => Ok(()),
-            Err(e) => Err(format!("write failed: {e}")),
-        };
-        if let Err(e) = outcome {
-            self.abort_stream(e);
+            Ok(true) => {
+                if let Err(e) = self.relisten().await {
+                    self.abort_stream(Some(e));
+                }
+            }
+            Ok(false) => {}
+            // `Connection::write` already logged this at [WARN]; just drop the
+            // stream so the next request re-establishes it.
+            Err(_) => self.abort_stream(None),
         }
     }
 
     async fn handle_notification(&mut self, event: Option<ValueNotification>) {
         let Some(event) = event else {
-            eprintln!("[WARN] Notification stream closed, reconnecting...");
-            let outcome = match self.conn.connect().await {
-                Ok(()) => self.relisten().await,
-                Err(e) => Err(format!("reconnect failed: {e}")),
-            };
-            if let Err(e) = outcome {
-                self.abort_stream(e);
+            match self.conn.reconnect_stream().await {
+                Ok(n) => self.apply_subscription(n),
+                // `reconnect_stream` already logged the "[WARN] ... reconnecting"
+                // line; surface the fatal failure and tear the stream down.
+                Err(e) => self.abort_stream(Some(format!("reconnect failed: {e}"))),
             }
             return;
         };
@@ -316,15 +324,13 @@ impl Actor {
             return;
         };
 
-        match connection::read_measure(&frame) {
-            Ok(m) => {
-                // The client hung up mid-stream.
-                if tx.send(Response::from_measurement(&m)).is_err() {
-                    self.streaming_client = None;
-                    self.notifications = None;
-                }
-            }
-            Err(e) => eprintln!("[ERR] Failed to parse measurement: {e}"),
+        let Some(m) = connection::try_measurement(&frame) else {
+            return;
+        };
+        // The client hung up mid-stream.
+        if tx.send(Response::from_measurement(&m)).is_err() {
+            self.streaming_client = None;
+            self.notifications = None;
         }
     }
 
