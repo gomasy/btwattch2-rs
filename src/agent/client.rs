@@ -9,9 +9,10 @@ use super::protocol::{Request, Response};
 
 pub async fn execute(
     request: &Request,
+    paths: &super::AgentPaths,
     mut on_response: impl FnMut(Response) -> ControlFlow<()>,
 ) -> Result<()> {
-    let mut stream = connect().await?;
+    let mut stream = connect(paths).await?;
 
     let mut buf = serde_json::to_vec(request)?;
     buf.push(b'\n');
@@ -41,21 +42,21 @@ pub async fn execute(
     Ok(())
 }
 
-pub async fn ping() -> Result<()> {
+pub async fn ping(paths: &super::AgentPaths) -> Result<()> {
     tokio::time::timeout(Duration::from_millis(500), {
-        execute(&Request::Ping, |_| ControlFlow::Break(()))
+        execute(&Request::Ping, paths, |_| ControlFlow::Break(()))
     })
     .await
     .map_err(|_| anyhow::anyhow!("agent ping timed out"))?
 }
 
-pub async fn send_shutdown() -> Result<()> {
-    execute(&Request::Shutdown, |_| ControlFlow::Break(())).await
+pub async fn send_shutdown(paths: &super::AgentPaths) -> Result<()> {
+    execute(&Request::Shutdown, paths, |_| ControlFlow::Break(())).await
 }
 
-async fn connect() -> Result<UnixStream> {
-    let path = super::socket_path();
-    UnixStream::connect(&path)
+async fn connect(paths: &super::AgentPaths) -> Result<UnixStream> {
+    let path = &paths.socket;
+    UnixStream::connect(path)
         .await
         .with_context(|| format!("failed to connect to agent at {}", path.display()))
 }

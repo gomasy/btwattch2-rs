@@ -175,6 +175,15 @@ Every command normally connects and disconnects BLE, which takes several seconds
 # btwattch2 agent stop
 ```
 
+The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock` (or `/tmp/btwattch2.sock` when `XDG_RUNTIME_DIR` is unset). Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
+
+```console
+# btwattch2 --socket /run/btwattch2/device-a.sock --addr CB:DF:6B:12:34:56 agent start
+# btwattch2 --socket /run/btwattch2/device-a.sock --on
+```
+
+The pid file is derived from the socket path by extension (`btwattch2.sock` → `btwattch2.pid`) by default, so usually you only set the socket. Override it independently with `--pid-file <path>` if you need the pid elsewhere. Run multiple agents on separate sockets (and pid files) to manage several devices at once.
+
 When the agent is running, CLI commands detect it and route through the socket. When it is not running, they fall back to direct BLE as before — no flags needed.
 
 ### Configuration file

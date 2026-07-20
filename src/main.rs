@@ -23,9 +23,10 @@ const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = cli.load_config()?;
+    let paths = cli.agent_paths();
 
     if let Some(Command::Agent { action }) = &cli.command {
-        return run_agent_command(action, &cli, cfg.as_ref()).await;
+        return run_agent_command(action, &cli, cfg.as_ref(), &paths).await;
     }
 
     let mode = cli.mode();
@@ -44,8 +45,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if agent::is_daemon_available().await {
-        return run_via_daemon(mode, &cli, log_level).await;
+    if agent::is_daemon_available(&paths).await {
+        return run_via_daemon(mode, &cli, log_level, &paths).await;
     }
 
     let mut conn = Connection::new(&cli.connection_config(cfg.as_ref())?).await?;
@@ -62,27 +63,27 @@ async fn run_agent_command(
     action: &AgentAction,
     cli: &Cli,
     cfg: Option<&cli::ConnectOpts>,
+    paths: &agent::AgentPaths,
 ) -> Result<()> {
     match action {
         AgentAction::Start => {
             let conn_cfg = cli.connection_config(cfg)?;
             let log_level = cli.log_level(false);
             connection::set_log_level(log_level);
-            agent::server::run(&conn_cfg).await
+            agent::server::run(&conn_cfg, paths).await
         }
         AgentAction::Stop => {
-            if !agent::is_daemon_available().await {
+            if !agent::is_daemon_available(paths).await {
                 eprintln!("Agent is not running");
                 return Ok(());
             }
-            agent::client::send_shutdown().await?;
+            agent::client::send_shutdown(paths).await?;
             eprintln!("Agent stopped");
             Ok(())
         }
         AgentAction::Status => {
-            if agent::is_daemon_available().await {
-                let pid_file = agent::pid_path();
-                let pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if agent::is_daemon_available(paths).await {
+                let pid = std::fs::read_to_string(&paths.pid).unwrap_or_default();
                 println!("Agent is running (pid {})", pid.trim());
             } else {
                 println!("Agent is not running");
@@ -92,16 +93,21 @@ async fn run_agent_command(
     }
 }
 
-async fn run_via_daemon(mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()> {
+async fn run_via_daemon(
+    mode: Mode,
+    cli: &Cli,
+    log_level: LogLevel,
+    paths: &agent::AgentPaths,
+) -> Result<()> {
     match mode {
         Mode::SetRtc(time) => {
             let req = Request::SetRtc {
                 time: time.to_rfc3339(),
             };
-            send_daemon_command(&req, "RTC set").await
+            send_daemon_command(&req, "RTC set", paths).await
         }
         Mode::GetRtc => {
-            agent::client::execute(&Request::GetRtc, |resp| {
+            agent::client::execute(&Request::GetRtc, paths, |resp| {
                 match resp.to_measurement() {
                     Some(m) => print_rtc_drift(&m),
                     None => {
@@ -116,9 +122,9 @@ async fn run_via_daemon(mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()
         }
         Mode::Power(on) => {
             let action = if on { "Power on" } else { "Power off" };
-            send_daemon_command(&Request::Power { on }, action).await
+            send_daemon_command(&Request::Power { on }, action, paths).await
         }
-        Mode::TestLed => send_daemon_command(&Request::TestLed, "Blink").await,
+        Mode::TestLed => send_daemon_command(&Request::TestLed, "Blink", paths).await,
         Mode::Metric(_) | Mode::Monitor => {
             let mut renderer = StreamRenderer::new(
                 cli.output_format(),
@@ -127,7 +133,7 @@ async fn run_via_daemon(mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()
                 log_level,
             );
 
-            let work = agent::client::execute(&Request::Subscribe, |resp| {
+            let work = agent::client::execute(&Request::Subscribe, paths, |resp| {
                 if let Some(m) = resp.to_measurement() {
                     renderer.record(&m)
                 } else if let Response::Error { message } = resp {
@@ -172,8 +178,8 @@ where
     }
 }
 
-async fn send_daemon_command(req: &Request, action: &str) -> Result<()> {
-    agent::client::execute(req, |resp| {
+async fn send_daemon_command(req: &Request, action: &str, paths: &agent::AgentPaths) -> Result<()> {
+    agent::client::execute(req, paths, |resp| {
         match resp {
             Response::CommandResult { success, code } => {
                 if success {

@@ -82,6 +82,17 @@ pub struct Cli {
     #[arg(short = 'c', long, value_name = "path")]
     pub config: Option<PathBuf>,
 
+    /// Path to the agent's unix socket. Defaults to
+    /// $XDG_RUNTIME_DIR/btwattch2.sock (or /tmp/btwattch2.sock).
+    #[arg(long, value_name = "path")]
+    pub socket: Option<PathBuf>,
+
+    /// Path to the agent's pid file. Defaults to the socket path with a
+    /// `.pid` extension, i.e. $XDG_RUNTIME_DIR/btwattch2.pid (or
+    /// /tmp/btwattch2.pid). Overrides the derived location.
+    #[arg(long, value_name = "path")]
+    pub pid_file: Option<PathBuf>,
+
     /// Turn on the power switch.
     #[arg(long, group = "mode")]
     pub on: bool,
@@ -321,6 +332,20 @@ impl Cli {
             }
         }
         Ok(Some(cfg))
+    }
+
+    /// Resolve the agent socket/pid paths, honouring `--socket` and
+    /// `--pid-file` if given. The pid file defaults to the socket path with a
+    /// `.pid` extension, which `--pid-file` overrides.
+    pub fn agent_paths(&self) -> crate::agent::AgentPaths {
+        let mut paths = match &self.socket {
+            Some(s) => crate::agent::paths_from_socket(s.clone()),
+            None => crate::agent::default_paths(),
+        };
+        if let Some(pid) = &self.pid_file {
+            paths.pid = pid.clone();
+        }
+        paths
     }
 }
 

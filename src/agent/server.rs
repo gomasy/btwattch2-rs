@@ -29,18 +29,24 @@ enum FrameKind {
     Measurement,
 }
 
-pub async fn run(config: &ConnectionConfig) -> Result<()> {
-    let sock = super::socket_path();
-    let pid_file = super::pid_path();
+pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result<()> {
+    let sock = &paths.socket;
+    let pid_file = &paths.pid;
 
-    cleanup_stale(&sock, &pid_file)?;
+    cleanup_stale(sock, pid_file)?;
     let listener =
-        UnixListener::bind(&sock).with_context(|| format!("failed to bind {}", sock.display()))?;
-    std::fs::write(&pid_file, std::process::id().to_string()).ok();
+        UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?;
+    std::fs::write(pid_file, std::process::id().to_string()).ok();
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
-    let conn = Connection::new(config).await?;
+    let conn = match Connection::new(config).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            cleanup_files(sock, pid_file);
+            return Err(e);
+        }
+    };
     eprintln!("[INFO] Connected to device");
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
@@ -52,7 +58,7 @@ pub async fn run(config: &ConnectionConfig) -> Result<()> {
 
     drop(cmd_tx);
     actor.await.ok();
-    cleanup_files(&sock, &pid_file);
+    cleanup_files(sock, pid_file);
     result
 }
 
