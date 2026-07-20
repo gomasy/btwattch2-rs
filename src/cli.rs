@@ -175,6 +175,16 @@ pub enum Mode {
     Monitor,
 }
 
+impl Mode {
+    /// Namespace prefix for rendered metrics.
+    pub fn prefix(&self) -> &str {
+        match self {
+            Mode::Metric(name) => name,
+            _ => "btwattch2",
+        }
+    }
+}
+
 impl Cli {
     pub fn mode(&self) -> Mode {
         if self.get_rtc {
@@ -193,6 +203,16 @@ impl Cli {
             Mode::Metric(name.clone())
         } else {
             Mode::Monitor
+        }
+    }
+
+    /// How many samples a streaming run should take. Metric mode takes a
+    /// single sample by default; `--count`/`--duration` extend the run, and
+    /// monitor mode streams until stopped.
+    pub fn sample_count(&self, mode: &Mode) -> Option<u64> {
+        match (matches!(mode, Mode::Metric(_)), self.count, self.duration) {
+            (true, None, None) => Some(1),
+            _ => self.count,
         }
     }
 

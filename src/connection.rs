@@ -25,6 +25,15 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_RETRIES: usize = 5;
 const CONNECT_RETRIES: usize = 5;
 
+/// Shortest frame that can carry a full measurement (through the 6-byte date
+/// at offset 23). Also what distinguishes a measurement reply from the much
+/// shorter status reply to a one-shot command.
+pub(crate) const MEASUREMENT_FRAME_MIN_LEN: usize = 29;
+
+/// Largest frame the device ever sends. Used only to bound the reassembly
+/// buffer, so a desynchronized stream cannot grow it without limit.
+const MAX_FRAME_LEN: usize = 256;
+
 const VOLTAGE_SCALE: f64 = (1u64 << 24) as f64;
 const AMPERE_SCALE: f64 = (1u64 << 30) as f64;
 const WATTAGE_SCALE: f64 = (1u64 << 24) as f64;
@@ -89,10 +98,20 @@ impl FrameAssembler {
 
         if self.buf.len() >= FRAME_OVERHEAD {
             let payload_len = u16::from_be_bytes([self.buf[1], self.buf[2]]) as usize;
-            if self.buf.len() - FRAME_OVERHEAD == payload_len {
-                let frame = std::mem::take(&mut self.buf);
+            // `>=` rather than `==`: a desynchronized stream can overshoot the
+            // declared length, and waiting for an exact match would wedge the
+            // assembler until the next header arrives.
+            if self.buf.len() - FRAME_OVERHEAD >= payload_len {
+                let mut frame = std::mem::take(&mut self.buf);
+                frame.truncate(payload_len + FRAME_OVERHEAD);
                 return Some(frame);
             }
+        }
+
+        // A bogus length field would otherwise let the buffer grow forever.
+        if self.buf.len() > MAX_FRAME_LEN {
+            eprintln!("[WARN] Discarding oversized frame buffer, resynchronizing");
+            self.buf.clear();
         }
         None
     }
@@ -423,7 +442,7 @@ impl Connection {
 }
 
 pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
-    if frame.len() < 29 {
+    if frame.len() < MEASUREMENT_FRAME_MIN_LEN {
         bail!("frame too short: {} bytes", frame.len());
     }
 
@@ -500,6 +519,38 @@ mod tests {
             ),
             (2021, 1, 2, 3, 4, 5)
         );
+    }
+
+    #[test]
+    fn frame_assembler_reassembles_split_frame() {
+        let mut a = FrameAssembler::new();
+        assert_eq!(a.feed(&[HEADER, 0x00, 0x03, 0x01]), None);
+        assert_eq!(
+            a.feed(&[0x02, 0x03, 0xFF]),
+            Some(vec![HEADER, 0x00, 0x03, 0x01, 0x02, 0x03, 0xFF])
+        );
+    }
+
+    #[test]
+    fn frame_assembler_restarts_on_new_header() {
+        let mut a = FrameAssembler::new();
+        assert_eq!(a.feed(&[HEADER, 0x00, 0x08, 0x01]), None);
+        // A fresh header mid-frame abandons the partial one.
+        assert_eq!(
+            a.feed(&[HEADER, 0x00, 0x01, 0x08, 0xB3]),
+            Some(vec![HEADER, 0x00, 0x01, 0x08, 0xB3])
+        );
+    }
+
+    #[test]
+    fn frame_assembler_discards_oversized_buffer() {
+        let mut a = FrameAssembler::new();
+        // Declares a payload far longer than any real frame.
+        a.feed(&[HEADER, 0xFF, 0xFF]);
+        for _ in 0..MAX_FRAME_LEN {
+            a.feed(&[0x00]);
+        }
+        assert!(a.buf.len() <= MAX_FRAME_LEN);
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod connection;
 mod output;
 mod payload;
 
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -12,9 +13,9 @@ use chrono::Local;
 use clap::Parser;
 
 use agent::protocol::{Request, Response};
-use cli::{AgentAction, Cli, Command, LogLevel, Mode, OutputFormat};
-use connection::{Connection, ScannedDevice};
-use output::{Printer, Stats};
+use cli::{AgentAction, Cli, Command, LogLevel, Mode};
+use connection::{Connection, Measurement, ScannedDevice};
+use output::StreamRenderer;
 
 const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
 
@@ -101,18 +102,13 @@ async fn run_via_daemon(mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()
         }
         Mode::GetRtc => {
             agent::client::execute(&Request::GetRtc, |resp| {
-                match resp {
-                    resp @ Response::Measurement { .. } => {
-                        if let Some(m) = resp.to_measurement() {
-                            let now = Local::now();
-                            let drift = m.timestamp.signed_duration_since(now);
-                            println!("device_time = {}", m.timestamp.to_rfc3339());
-                            println!("system_time = {}", now.to_rfc3339());
-                            println!("drift_seconds = {}", drift.num_seconds());
+                match resp.to_measurement() {
+                    Some(m) => print_rtc_drift(&m),
+                    None => {
+                        if let Response::Error { message } = resp {
+                            eprintln!("[ERR] {message}");
                         }
                     }
-                    Response::Error { ref message } => eprintln!("[ERR] {message}"),
-                    _ => {}
                 }
                 ControlFlow::Break(())
             })
@@ -124,57 +120,55 @@ async fn run_via_daemon(mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()
         }
         Mode::TestLed => send_daemon_command(&Request::TestLed, "Blink").await,
         Mode::Metric(_) | Mode::Monitor => {
-            let prefix = if let Mode::Metric(ref name) = mode {
-                name.clone()
-            } else {
-                "btwattch2".to_string()
-            };
-
-            let count = if matches!(mode, Mode::Metric(_)) {
-                match (cli.count, cli.duration) {
-                    (None, None) => Some(1),
-                    (count, _) => count,
-                }
-            } else {
-                cli.count
-            };
-
-            let mut printer = Printer::new(cli.output_format(), &prefix);
-            let mut stats = Stats::new();
-            let mut samples = 0u64;
+            let mut renderer = StreamRenderer::new(
+                cli.output_format(),
+                mode.prefix(),
+                cli.sample_count(&mode),
+                log_level,
+            );
 
             let work = agent::client::execute(&Request::Subscribe, |resp| {
                 if let Some(m) = resp.to_measurement() {
-                    let energy_wh = stats.record(&m);
-                    printer.print(&m, energy_wh);
-                    samples += 1;
-                    if count.is_some_and(|c| samples >= c) {
-                        return ControlFlow::Break(());
-                    }
+                    renderer.record(&m)
                 } else if let Response::Error { message } = resp {
                     eprintln!("[ERR] {message}");
-                    return ControlFlow::Break(());
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
                 }
-                ControlFlow::Continue(())
             });
 
-            match cli.duration {
-                Some(secs) => tokio::select! {
-                    result = work => result?,
-                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
-                    _ = tokio::signal::ctrl_c() => {},
-                },
-                None => tokio::select! {
-                    result = work => result?,
-                    _ = tokio::signal::ctrl_c() => {},
-                },
-            }
-
-            if log_level == LogLevel::Info {
-                stats.print_summary();
-            }
-            Ok(())
+            until_deadline(work, cli.duration).await
         }
+    }
+}
+
+/// Report the device RTC against the system clock.
+fn print_rtc_drift(m: &Measurement) {
+    let now = Local::now();
+    let drift = m.timestamp.signed_duration_since(now);
+    println!("device_time = {}", m.timestamp.to_rfc3339());
+    println!("system_time = {}", now.to_rfc3339());
+    println!("drift_seconds = {}", drift.num_seconds());
+}
+
+/// Run `work` until it finishes, `duration` seconds elapse, or Ctrl-C. The
+/// early exits are not errors: a `--duration` run ending is a normal stop, and
+/// dropping `work` here lets its renderer print the summary.
+async fn until_deadline<F>(work: F, duration: Option<u64>) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    match duration {
+        Some(secs) => tokio::select! {
+            result = work => result,
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => Ok(()),
+            _ = tokio::signal::ctrl_c() => Ok(()),
+        },
+        None => tokio::select! {
+            result = work => result,
+            _ = tokio::signal::ctrl_c() => Ok(()),
+        },
     }
 }
 
@@ -201,97 +195,23 @@ async fn run(conn: &mut Connection, mode: Mode, cli: &Cli, log_level: LogLevel) 
         Mode::SetRtc(time) => conn.set_rtc(&time).await,
         Mode::GetRtc => {
             conn.subscribe_measure(|m| {
-                let now = Local::now();
-                let drift = m.timestamp.signed_duration_since(now);
-                println!("device_time = {}", m.timestamp.to_rfc3339());
-                println!("system_time = {}", now.to_rfc3339());
-                println!("drift_seconds = {}", drift.num_seconds());
+                print_rtc_drift(&m);
                 ControlFlow::Break(())
             })
             .await
         }
         Mode::Power(on) => conn.power(on).await,
         Mode::TestLed => conn.blink_led().await,
-        Mode::Metric(name) => {
-            // One sample by default; --count/--duration extend the run.
-            let count = match (cli.count, cli.duration) {
-                (None, None) => Some(1),
-                (count, _) => count,
-            };
-            run_stream(
-                conn,
-                &name,
+        Mode::Metric(_) | Mode::Monitor => {
+            let mut renderer = StreamRenderer::new(
                 cli.output_format(),
-                count,
-                cli.duration,
-                LogLevel::Off,
-            )
-            .await
-        }
-        Mode::Monitor => {
-            run_stream(
-                conn,
-                "btwattch2",
-                cli.output_format(),
-                cli.count,
-                cli.duration,
+                mode.prefix(),
+                cli.sample_count(&mode),
                 log_level,
-            )
-            .await
+            );
+            let work = conn.subscribe_measure(|m| renderer.record(&m));
+            until_deadline(work, cli.duration).await
         }
-    }
-}
-
-/// Drive a measurement subscription, rendering each sample. `count` stops
-/// after N samples; `duration` stops after the given seconds; either way —
-/// including Ctrl-C, which cancels this future from main's select — the
-/// summary is printed on drop when `log_level` allows it.
-async fn run_stream(
-    conn: &mut Connection,
-    prefix: &str,
-    format: OutputFormat,
-    count: Option<u64>,
-    duration: Option<u64>,
-    log_level: LogLevel,
-) -> Result<()> {
-    /// Prints the summary when dropped, so cancellation paths (Ctrl-C,
-    /// --duration timeout) report it too.
-    struct SummaryOnDrop {
-        stats: Stats,
-        enabled: bool,
-    }
-    impl Drop for SummaryOnDrop {
-        fn drop(&mut self) {
-            if self.enabled {
-                self.stats.print_summary();
-            }
-        }
-    }
-
-    let mut printer = Printer::new(format, prefix);
-    let mut summary = SummaryOnDrop {
-        stats: Stats::new(),
-        enabled: log_level == LogLevel::Info,
-    };
-
-    let mut samples = 0u64;
-    let work = conn.subscribe_measure(|m| {
-        let energy_wh = summary.stats.record(&m);
-        printer.print(&m, energy_wh);
-        samples += 1;
-        if count.is_some_and(|c| samples >= c) {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
-
-    match duration {
-        Some(secs) => tokio::select! {
-            result = work => result,
-            _ = tokio::time::sleep(Duration::from_secs(secs)) => Ok(()),
-        },
-        None => work.await,
     }
 }
 

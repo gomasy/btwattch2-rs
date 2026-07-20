@@ -1,6 +1,7 @@
+use std::ops::ControlFlow;
 use std::time::Instant;
 
-use crate::cli::OutputFormat;
+use crate::cli::{LogLevel, OutputFormat};
 use crate::connection::Measurement;
 
 /// (name, help text, accessor) of one measurement channel.
@@ -113,6 +114,55 @@ impl Printer {
     }
 }
 
+/// Drives a measurement stream: renders each sample, folds it into the running
+/// statistics, and stops after `count` samples. The summary is printed when the
+/// renderer is dropped, so cancellation paths (Ctrl-C, `--duration` timeout)
+/// report it as well as a run that finishes on its own.
+pub struct StreamRenderer {
+    printer: Printer,
+    stats: Stats,
+    samples: u64,
+    count: Option<u64>,
+    summary: bool,
+}
+
+impl StreamRenderer {
+    pub fn new(
+        format: OutputFormat,
+        prefix: &str,
+        count: Option<u64>,
+        log_level: LogLevel,
+    ) -> Self {
+        Self {
+            printer: Printer::new(format, prefix),
+            stats: Stats::new(),
+            samples: 0,
+            count,
+            summary: log_level == LogLevel::Info,
+        }
+    }
+
+    /// Render one measurement, breaking once `count` samples have been seen.
+    pub fn record(&mut self, m: &Measurement) -> ControlFlow<()> {
+        let energy_wh = self.stats.record(m);
+        self.printer.print(m, energy_wh);
+        self.samples += 1;
+        if self.count.is_some_and(|c| self.samples >= c) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+impl Drop for StreamRenderer {
+    fn drop(&mut self) {
+        if self.summary {
+            self.stats.print_summary();
+        }
+    }
+}
+
 /// Per-channel running min/max/sum.
 #[derive(Default)]
 struct Channel {
@@ -215,6 +265,21 @@ mod tests {
     fn first_sample_contributes_no_energy() {
         let mut stats = Stats::new();
         assert_eq!(stats.record(&measurement(3600.0)), 0.0);
+    }
+
+    #[test]
+    fn renderer_breaks_at_count() {
+        let mut r = StreamRenderer::new(OutputFormat::Json, "t", Some(2), LogLevel::Off);
+        assert!(r.record(&measurement(1.0)).is_continue());
+        assert!(r.record(&measurement(1.0)).is_break());
+    }
+
+    #[test]
+    fn renderer_without_count_never_breaks() {
+        let mut r = StreamRenderer::new(OutputFormat::Json, "t", None, LogLevel::Off);
+        for _ in 0..3 {
+            assert!(r.record(&measurement(1.0)).is_continue());
+        }
     }
 
     #[test]
