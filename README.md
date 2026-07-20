@@ -22,7 +22,10 @@ A single binary, `btwattch2`, is generated in `target/release/`.
 ## Usage
 
 ```
-Usage: btwattch2 [OPTIONS]
+Usage: btwattch2 [OPTIONS] [COMMAND]
+
+Commands:
+  agent  Manage the persistent agent (start, stop, status)
 
 Options:
   -i, --index <index>       Specify adapter index, e.g. hci0 [default: 0]
@@ -154,6 +157,25 @@ device_time = 2026-07-17T12:00:03+09:00
 system_time = 2026-07-17T12:00:05+09:00
 drift_seconds = -2
 ```
+
+### Agent (daemon) mode
+
+Every command normally connects and disconnects BLE, which takes several seconds. The agent keeps the connection alive in the foreground so subsequent commands execute instantly via a Unix domain socket.
+
+```console
+# Start the agent (stays in the foreground; use systemd/nohup to daemonize)
+# btwattch2 --addr CB:DF:6B:12:34:56 agent start
+
+# In another terminal — commands go through the agent automatically
+# btwattch2 --on
+# btwattch2 --count 5
+
+# Check status / stop
+# btwattch2 agent status
+# btwattch2 agent stop
+```
+
+When the agent is running, CLI commands detect it and route through the socket. When it is not running, they fall back to direct BLE as before — no flags needed.
 
 ### Configuration file
 

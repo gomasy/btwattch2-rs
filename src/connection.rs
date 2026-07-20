@@ -19,7 +19,7 @@ use crate::payload::{self, FRAME_OVERHEAD, HEADER};
 
 // TX/RX characteristics of the Nordic UART service the device exposes.
 const C_TX: Uuid = uuid!("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
-const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+pub(crate) const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_RETRIES: usize = 5;
@@ -29,7 +29,7 @@ const VOLTAGE_SCALE: f64 = (1u64 << 24) as f64;
 const AMPERE_SCALE: f64 = (1u64 << 30) as f64;
 const WATTAGE_SCALE: f64 = (1u64 << 24) as f64;
 
-type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
+pub(crate) type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
 
 static INFO: AtomicBool = AtomicBool::new(false);
 
@@ -70,6 +70,36 @@ pub struct ScannedDevice {
     pub addr: BDAddr,
     pub name: Option<String>,
     pub rssi: Option<i16>,
+}
+
+pub(crate) struct FrameAssembler {
+    buf: Vec<u8>,
+}
+
+impl FrameAssembler {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if !self.buf.is_empty() && data.first() == Some(&HEADER) {
+            self.buf.clear();
+        }
+        self.buf.extend_from_slice(data);
+
+        if self.buf.len() >= FRAME_OVERHEAD {
+            let payload_len = u16::from_be_bytes([self.buf[1], self.buf[2]]) as usize;
+            if self.buf.len() - FRAME_OVERHEAD == payload_len {
+                let frame = std::mem::take(&mut self.buf);
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
 }
 
 pub struct Connection {
@@ -243,7 +273,7 @@ impl Connection {
         Ok((tx, rx))
     }
 
-    async fn connect(&mut self) -> Result<()> {
+    pub(crate) async fn connect(&mut self) -> Result<()> {
         let (tx, rx) = Self::establish(&self.device, self.addr, &self.name).await?;
         self.tx = tx;
         self.rx = rx;
@@ -263,6 +293,10 @@ impl Connection {
         if device.is_connected().await.unwrap_or(false) {
             device.disconnect().await.ok();
         }
+    }
+
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
     }
 
     pub async fn set_rtc(&mut self, time: &DateTime<Local>) -> Result<()> {
@@ -300,16 +334,13 @@ impl Connection {
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
         let mut notifications = self.listen().await?;
-
-        let mut buf: Vec<u8> = Vec::new();
+        let mut assembler = FrameAssembler::new();
         let mut ticker = tokio::time::interval(self.interval);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     if self.write(&payload).await? {
-                        // Reconnected: the old stream belongs to the previous
-                        // connection, so re-subscribe and listen again.
                         notifications = self.listen().await?;
                     }
                 }
@@ -318,7 +349,7 @@ impl Connection {
                         eprintln!("[WARN] Notification stream closed, reconnecting...");
                         self.connect().await?;
                         notifications = self.listen().await?;
-                        buf.clear();
+                        assembler.clear();
                         continue;
                     };
 
@@ -326,20 +357,10 @@ impl Connection {
                         continue;
                     }
 
-                    if !buf.is_empty() && event.value.first() == Some(&HEADER) {
-                        buf.clear();
-                    }
-                    buf.extend_from_slice(&event.value);
-
-                    if buf.len() >= FRAME_OVERHEAD {
-                        let payload_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
-                        if buf.len() - FRAME_OVERHEAD != payload_len {
-                            continue;
-                        }
-                        if on_frame(&buf).is_break() {
-                            return Ok(());
-                        }
-                        buf.clear();
+                    if let Some(frame) = assembler.feed(&event.value)
+                        && on_frame(&frame).is_break()
+                    {
+                        return Ok(());
                     }
                 }
             }
@@ -360,14 +381,14 @@ impl Connection {
         .await
     }
 
-    async fn listen(&self) -> Result<Notifications> {
+    pub(crate) async fn listen(&self) -> Result<Notifications> {
         self.device.subscribe(&self.rx).await?;
         Ok(self.device.notifications().await?)
     }
 
     /// Write `payload`, reconnecting on failure. Returns whether the
     /// connection was re-established along the way.
-    async fn write(&mut self, payload: &[u8]) -> Result<bool> {
+    pub(crate) async fn write(&mut self, payload: &[u8]) -> Result<bool> {
         let mut reconnected = false;
 
         for attempt in 1.. {
@@ -401,7 +422,7 @@ impl Connection {
     }
 }
 
-fn read_measure(frame: &[u8]) -> Result<Measurement> {
+pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
     if frame.len() < 29 {
         bail!("frame too short: {} bytes", frame.len());
     }

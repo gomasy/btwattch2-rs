@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use btleplug::api::BDAddr;
 use chrono::{DateTime, Local, NaiveDateTime, TimeDelta, TimeZone};
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_INDEX: usize = 0;
 pub const DEFAULT_INTERVAL: u64 = 1;
@@ -138,6 +138,28 @@ pub struct Cli {
     /// Set the verbosity of informational messages. Overrides --debug/--quiet.
     #[arg(long, value_enum, value_name = "level")]
     pub log_level: Option<LogLevel>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Manage the persistent connection agent.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentAction {
+    /// Start the agent daemon (runs in the foreground).
+    Start,
+    /// Stop a running agent daemon.
+    Stop,
+    /// Show agent daemon status.
+    Status,
 }
 
 /// What the invocation asks the tool to do, `--scan` aside (main handles it
