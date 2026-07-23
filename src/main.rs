@@ -165,16 +165,17 @@ async fn until_deadline<F>(work: F, duration: Option<u64>) -> Result<()>
 where
     F: Future<Output = Result<()>>,
 {
-    match duration {
-        Some(secs) => tokio::select! {
-            result = work => result,
-            _ = tokio::time::sleep(Duration::from_secs(secs)) => Ok(()),
-            _ = tokio::signal::ctrl_c() => Ok(()),
-        },
-        None => tokio::select! {
-            result = work => result,
-            _ = tokio::signal::ctrl_c() => Ok(()),
-        },
+    let deadline = async {
+        match duration {
+            Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    tokio::select! {
+        result = work => result,
+        _ = deadline => Ok(()),
+        _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
 

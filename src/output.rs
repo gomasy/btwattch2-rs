@@ -164,21 +164,26 @@ impl Drop for StreamRenderer {
 }
 
 /// Per-channel running min/max/sum.
-#[derive(Default)]
 struct Channel {
     min: f64,
     max: f64,
     sum: f64,
 }
 
-impl Channel {
-    fn record(&mut self, value: f64, first: bool) {
-        if first {
-            (self.min, self.max) = (value, value);
-        } else {
-            self.min = self.min.min(value);
-            self.max = self.max.max(value);
+impl Default for Channel {
+    fn default() -> Self {
+        Self {
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            sum: 0.0,
         }
+    }
+}
+
+impl Channel {
+    fn record(&mut self, value: f64) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
         self.sum += value;
     }
 }
@@ -213,10 +218,9 @@ impl Stats {
         }
         self.last_sample = Some(now);
 
-        let first = self.count == 0;
         self.count += 1;
         for ((_, _, value), channel) in CHANNELS.iter().zip(&mut self.channels) {
-            channel.record(value(m), first);
+            channel.record(value(m));
         }
         self.energy_wh
     }

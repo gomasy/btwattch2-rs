@@ -492,10 +492,9 @@ pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
 }
 
 fn u48_le(payload: &[u8]) -> u64 {
-    payload
-        .iter()
-        .rev()
-        .fold(0, |acc, &byte| (acc << 8) | u64::from(byte))
+    let mut bytes = [0u8; 8];
+    bytes[..6].copy_from_slice(&payload[..6]);
+    u64::from_le_bytes(bytes)
 }
 
 #[cfg(test)]

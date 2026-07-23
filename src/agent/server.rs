@@ -445,12 +445,8 @@ fn send_error(tx: &mpsc::UnboundedSender<Response>, message: String) {
 }
 
 fn reply(tx: &mpsc::UnboundedSender<Response>, result: Result<Response, StreamError>) {
-    match result {
-        Ok(r) => {
-            tx.send(r).ok();
-        }
-        Err(message) => send_error(tx, message),
-    }
+    let resp = result.unwrap_or_else(|message| Response::Error { message });
+    tx.send(resp).ok();
 }
 
 /// Read notifications until one reassembles into a frame of the expected kind.
