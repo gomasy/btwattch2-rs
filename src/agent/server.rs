@@ -1,6 +1,6 @@
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use btleplug::api::ValueNotification;
@@ -12,31 +12,26 @@ use tokio::sync::{Notify, mpsc};
 use super::protocol::{Request, Response};
 use crate::cli::ConnectionConfig;
 use crate::connection::{
-    self, Connection, FrameAssembler, MEASUREMENT_FRAME_MIN_LEN, Notifications,
+    self, COMMAND_TIMEOUT, Connection, FrameAssembler, FrameKind, Notifications,
 };
 use crate::payload;
-
-/// How long a one-shot command waits for its reply frame.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ActorCommand {
     request: Request,
     tx: mpsc::UnboundedSender<Response>,
 }
 
-enum FrameKind {
-    Command,
-    Measurement,
-}
-
 pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result<()> {
     let sock = &paths.socket;
     let pid_file = &paths.pid;
 
-    cleanup_stale(sock, pid_file)?;
+    cleanup_stale(paths).await?;
     let listener =
         UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?;
-    std::fs::write(pid_file, std::process::id().to_string()).ok();
+    if let Err(e) = std::fs::write(pid_file, std::process::id().to_string()) {
+        std::fs::remove_file(sock).ok();
+        return Err(e).with_context(|| format!("failed to write {}", pid_file.display()));
+    }
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
@@ -49,27 +44,46 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     };
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
+    // Two separate signals rather than one: the accept loop must stop first so
+    // the actor can finish in-flight work, and `notify_one` leaves a permit
+    // behind when the target is momentarily not parked on `notified()`, which
+    // a shared `notify_waiters` would drop on the floor.
     let shutdown = std::sync::Arc::new(Notify::new());
+    let actor_shutdown = std::sync::Arc::new(Notify::new());
 
-    let actor = tokio::spawn(actor_loop(conn, cmd_rx, shutdown.clone()));
+    let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone()));
+    let result = tokio::select! {
+        result = accept_loop(listener, cmd_tx.clone(), shutdown) => result,
+        actor_result = &mut actor => {
+            cleanup_files(sock, pid_file);
+            actor_result.context("agent actor failed")?;
+            bail!("agent actor stopped unexpectedly");
+        }
+    };
 
-    let result = accept_loop(listener, cmd_tx.clone(), &shutdown).await;
-
+    actor_shutdown.notify_one();
     drop(cmd_tx);
     actor.await.ok();
     cleanup_files(sock, pid_file);
     result
 }
 
-fn cleanup_stale(sock: &Path, pid_file: &Path) -> Result<()> {
-    if let Ok(pid_str) = std::fs::read_to_string(pid_file)
+/// Refuse to start when a previous agent is still alive, and clear its leftover
+/// files when it is not. The pid check is a free `/proc` stat, so the socket
+/// round trip is only worth paying for when there is no usable pid file left.
+async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
+    if let Ok(pid_str) = std::fs::read_to_string(&paths.pid)
         && let Ok(pid) = pid_str.trim().parse::<u32>()
-        && Path::new(&format!("/proc/{pid}")).exists()
     {
-        bail!("agent is already running (pid {pid})");
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            bail!("agent is already running (pid {pid})");
+        }
+    } else if paths.socket.exists() && super::client::ping(paths).await.is_ok() {
+        bail!("agent is already running");
     }
-    std::fs::remove_file(sock).ok();
-    std::fs::remove_file(pid_file).ok();
+
+    std::fs::remove_file(&paths.socket).ok();
+    std::fs::remove_file(&paths.pid).ok();
     Ok(())
 }
 
@@ -82,7 +96,7 @@ fn cleanup_files(sock: &Path, pid_file: &Path) {
 async fn accept_loop(
     listener: UnixListener,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
-    shutdown: &Notify,
+    shutdown: std::sync::Arc<Notify>,
 ) -> Result<()> {
     let sigterm = async {
         #[cfg(unix)]
@@ -101,7 +115,8 @@ async fn accept_loop(
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let tx = cmd_tx.clone();
-                        tokio::spawn(handle_client(stream, tx));
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(handle_client(stream, tx, shutdown));
                     }
                     Err(e) => {
                         eprintln!("[WARN] Accept failed: {e}");
@@ -122,7 +137,11 @@ async fn accept_loop(
     Ok(())
 }
 
-async fn handle_client(stream: UnixStream, cmd_tx: mpsc::UnboundedSender<ActorCommand>) {
+async fn handle_client(
+    stream: UnixStream,
+    cmd_tx: mpsc::UnboundedSender<ActorCommand>,
+    shutdown: std::sync::Arc<Notify>,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -141,6 +160,15 @@ async fn handle_client(stream: UnixStream, cmd_tx: mpsc::UnboundedSender<ActorCo
             return;
         }
     };
+
+    if let Some(response) = control_response(&request, cmd_tx.is_closed()) {
+        if send_response(&mut writer, &response).await.is_ok()
+            && matches!(request, Request::Shutdown)
+        {
+            shutdown.notify_one();
+        }
+        return;
+    }
 
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<Response>();
     let cmd = ActorCommand {
@@ -163,6 +191,20 @@ async fn handle_client(stream: UnixStream, cmd_tx: mpsc::UnboundedSender<ActorCo
         if !matches!(resp, Response::Measurement { .. }) {
             break;
         }
+    }
+}
+
+/// The requests the connection handler answers itself, so `agent status` and
+/// `agent stop` stay responsive while the actor is busy on the BLE link.
+/// `None` means the request is actor-bound work.
+fn control_response(request: &Request, actor_gone: bool) -> Option<Response> {
+    match request {
+        Request::Ping if actor_gone => Some(Response::Error {
+            message: "agent actor is not running".to_string(),
+        }),
+        Request::Ping => Some(Response::Pong),
+        Request::Shutdown => Some(Response::Ok),
+        _ => None,
     }
 }
 
@@ -210,26 +252,41 @@ async fn actor_loop(
 
     loop {
         let event = tokio::select! {
+            _ = shutdown.notified() => break,
             cmd = cmd_rx.recv() => Event::Command(cmd),
             _ = actor.ticker.tick(), if actor.streaming_client.is_some() => Event::Tick,
             event = next_notification(&mut actor.notifications) => Event::Notification(event),
         };
 
-        match event {
+        let flow = match event {
             // The last client handle is gone: nothing left to serve.
-            Event::Command(None) => break,
-            Event::Command(Some(cmd)) => {
-                if actor.handle(cmd).await.is_break() {
-                    shutdown.notify_one();
-                    break;
-                }
+            Event::Command(None) => ControlFlow::Break(()),
+            Event::Command(Some(cmd)) => until_shutdown(actor.handle(cmd), &shutdown).await,
+            Event::Tick => until_shutdown(actor.poll_device(), &shutdown).await,
+            Event::Notification(event) => {
+                until_shutdown(actor.handle_notification(event), &shutdown).await
             }
-            Event::Tick => actor.poll_device().await,
-            Event::Notification(event) => actor.handle_notification(event).await,
+        };
+        if flow.is_break() {
+            break;
         }
     }
 
-    actor.conn.disconnect().await.ok();
+    // However the loop ended, the streaming client is owed a clean end: it
+    // reads a closed socket as a protocol error, not as a normal stop.
+    end_stream(&mut actor.streaming_client);
+    tokio::time::timeout(COMMAND_TIMEOUT, actor.conn.disconnect())
+        .await
+        .ok();
+}
+
+/// Run `work` to completion, abandoning it if shutdown is signalled first.
+/// `Break` means the actor should stop.
+async fn until_shutdown(work: impl Future<Output = ()>, shutdown: &Notify) -> ControlFlow<()> {
+    tokio::select! {
+        _ = work => ControlFlow::Continue(()),
+        _ = shutdown.notified() => ControlFlow::Break(()),
+    }
 }
 
 /// Next RX notification, or a future that never resolves while no stream is
@@ -274,14 +331,12 @@ impl Actor {
         }
     }
 
-    /// Tear the streaming state down. When `reason` is `Some`, it is logged as
-    /// an `[ERR]`; write failures are already logged by `Connection::write`, so
-    /// the agent passes `None` to avoid a duplicate line.
-    fn abort_stream(&mut self, reason: Option<StreamError>) {
-        if let Some(e) = reason {
-            eprintln!("[ERR] {e}");
+    /// Tear the streaming state down and report the failure to the client.
+    fn abort_stream(&mut self, reason: StreamError) {
+        eprintln!("[ERR] {reason}");
+        if let Some(tx) = self.streaming_client.take() {
+            tx.send(Response::Error { message: reason }).ok();
         }
-        end_stream(&mut self.streaming_client);
         self.notifications = None;
     }
 
@@ -291,13 +346,11 @@ impl Actor {
             // A reconnect along the way invalidated the old subscription.
             Ok(true) => {
                 if let Err(e) = self.relisten().await {
-                    self.abort_stream(Some(e));
+                    self.abort_stream(e);
                 }
             }
             Ok(false) => {}
-            // `Connection::write` already logged this at [WARN]; just drop the
-            // stream so the next request re-establishes it.
-            Err(_) => self.abort_stream(None),
+            Err(e) => self.abort_stream(format!("measurement write failed: {e}")),
         }
     }
 
@@ -307,7 +360,7 @@ impl Actor {
                 Ok(n) => self.apply_subscription(n),
                 // `reconnect_stream` already logged the "[WARN] ... reconnecting"
                 // line; surface the fatal failure and tear the stream down.
-                Err(e) => self.abort_stream(Some(format!("reconnect failed: {e}"))),
+                Err(e) => self.abort_stream(format!("reconnect failed: {e}")),
             }
             return;
         };
@@ -316,36 +369,29 @@ impl Actor {
             return;
         }
 
-        // Frames arriving with no subscriber are stray replies; drop them.
-        let Some(frame) = self.assembler.feed(&event.value) else {
-            return;
-        };
-        let Some(tx) = self.streaming_client.as_ref() else {
+        let Some(tx) = self.streaming_client.clone() else {
             return;
         };
 
-        let Some(m) = connection::try_measurement(&frame) else {
-            return;
-        };
-        // The client hung up mid-stream.
-        if tx.send(Response::from_measurement(&m)).is_err() {
-            self.streaming_client = None;
-            self.notifications = None;
+        for frame in self.assembler.feed(&event.value) {
+            let Some(m) = connection::try_measurement(&frame) else {
+                continue;
+            };
+            // The client hung up mid-stream.
+            if tx.send(Response::from_measurement(&m)).is_err() {
+                self.streaming_client = None;
+                self.notifications = None;
+                break;
+            }
         }
     }
 
-    /// Serve one client request. `Break` means the agent should shut down.
-    async fn handle(&mut self, cmd: ActorCommand) -> ControlFlow<()> {
+    /// Serve one client request.
+    async fn handle(&mut self, cmd: ActorCommand) {
         match cmd.request {
-            Request::Ping => {
-                cmd.tx.send(Response::Pong).ok();
-            }
-
-            Request::Shutdown => {
-                end_stream(&mut self.streaming_client);
-                cmd.tx.send(Response::Ok).ok();
-                return ControlFlow::Break(());
-            }
+            // `handle_client` answers these itself so they stay responsive
+            // while the actor is busy on the link; they never reach here.
+            Request::Ping | Request::Shutdown => {}
 
             Request::Subscribe => {
                 if self.streaming_client.is_some() {
@@ -359,8 +405,9 @@ impl Actor {
             }
 
             Request::GetRtc => {
+                let p = self.monitoring_payload.clone();
                 let resp = self
-                    .oneshot(&payload::monitoring(), FrameKind::Measurement)
+                    .oneshot(&p, FrameKind::Measurement)
                     .await
                     .and_then(|frame| {
                         connection::read_measure(&frame)
@@ -387,7 +434,6 @@ impl Actor {
                 Err(e) => send_error(&cmd.tx, format!("invalid time: {e}")),
             },
         }
-        ControlFlow::Continue(())
     }
 
     /// Send a one-shot command frame and reply with its status byte.
@@ -412,19 +458,27 @@ impl Actor {
             self.relisten().await?;
         }
 
-        match self.conn.write(cmd_payload).await {
-            Ok(true) => self.relisten().await?,
-            Ok(false) => {}
-            Err(e) => return Err(format!("write failed: {e}")),
-        }
-
-        let result = wait_for_frame(&mut self.notifications, kind).await;
+        let result = self.write_and_wait(cmd_payload, kind).await;
 
         if !was_streaming {
             self.notifications = None;
         }
 
         result
+    }
+
+    async fn write_and_wait(
+        &mut self,
+        cmd_payload: &[u8],
+        kind: FrameKind,
+    ) -> Result<Vec<u8>, StreamError> {
+        match self.conn.write(cmd_payload).await {
+            Ok(true) => self.relisten().await?,
+            Ok(false) => {}
+            Err(e) => return Err(format!("write failed: {e}")),
+        }
+
+        wait_for_frame(&mut self.notifications, kind).await
     }
 }
 
@@ -469,12 +523,9 @@ async fn wait_for_frame(
             if event.uuid != connection::C_RX {
                 continue;
             }
-            if let Some(frame) = assembler.feed(&event.value) {
-                let is_measurement = frame.len() >= MEASUREMENT_FRAME_MIN_LEN;
-                match kind {
-                    FrameKind::Command if is_measurement => continue,
-                    FrameKind::Measurement if !is_measurement => continue,
-                    _ => return Ok(frame),
+            for frame in assembler.feed(&event.value) {
+                if kind.matches(&frame) {
+                    return Ok(frame);
                 }
             }
         }

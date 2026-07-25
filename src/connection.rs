@@ -22,13 +22,15 @@ const C_TX: Uuid = uuid!("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
 pub(crate) const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a one-shot command waits for its reply frame.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_RETRIES: usize = 5;
 const CONNECT_RETRIES: usize = 5;
 
 /// Shortest frame that can carry a full measurement (through the 6-byte date
 /// at offset 23). Also what distinguishes a measurement reply from the much
 /// shorter status reply to a one-shot command.
-pub(crate) const MEASUREMENT_FRAME_MIN_LEN: usize = 29;
+pub(crate) const MEASUREMENT_FRAME_MIN_LEN: usize = 30;
 
 /// Largest frame the device ever sends. Used only to bound the reassembly
 /// buffer, so a desynchronized stream cannot grow it without limit.
@@ -48,7 +50,7 @@ pub fn set_log_level(level: LogLevel) {
     INFO.store(level == LogLevel::Info, Ordering::Relaxed);
 }
 
-fn info_enabled() -> bool {
+pub(crate) fn info_enabled() -> bool {
     INFO.load(Ordering::Relaxed)
 }
 
@@ -56,11 +58,12 @@ fn info_enabled() -> bool {
 // Warnings and errors are printed unconditionally with plain `eprintln!`.
 macro_rules! info {
     ($($arg:tt)*) => {
-        if info_enabled() {
+        if $crate::connection::info_enabled() {
             eprintln!("[INFO] {}", format_args!($($arg)*));
         }
     };
 }
+pub(crate) use info;
 
 #[derive(Debug)]
 pub struct Measurement {
@@ -81,6 +84,20 @@ pub struct ScannedDevice {
     pub rssi: Option<i16>,
 }
 
+/// Which reply a one-shot write is waiting for. The two are told apart by
+/// length alone, since a streaming measurement can arrive while a one-shot
+/// command is in flight.
+pub(crate) enum FrameKind {
+    Command,
+    Measurement,
+}
+
+impl FrameKind {
+    pub(crate) fn matches(&self, frame: &[u8]) -> bool {
+        (frame.len() >= MEASUREMENT_FRAME_MIN_LEN) == matches!(self, Self::Measurement)
+    }
+}
+
 pub(crate) struct FrameAssembler {
     buf: Vec<u8>,
 }
@@ -90,30 +107,47 @@ impl FrameAssembler {
         Self { buf: Vec::new() }
     }
 
-    pub fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        if !self.buf.is_empty() && data.first() == Some(&HEADER) {
-            self.buf.clear();
-        }
+    /// Append `data` and yield every frame it completes. A single BLE
+    /// notification can carry more than one, so callers drain the iterator.
+    pub fn feed(&mut self, data: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
         self.buf.extend_from_slice(data);
+        std::iter::from_fn(|| self.next_frame())
+    }
 
-        if self.buf.len() >= FRAME_OVERHEAD {
-            let payload_len = u16::from_be_bytes([self.buf[1], self.buf[2]]) as usize;
-            // `>=` rather than `==`: a desynchronized stream can overshoot the
-            // declared length, and waiting for an exact match would wedge the
-            // assembler until the next header arrives.
-            if self.buf.len() - FRAME_OVERHEAD >= payload_len {
-                let mut frame = std::mem::take(&mut self.buf);
-                frame.truncate(payload_len + FRAME_OVERHEAD);
-                return Some(frame);
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let Some(header) = self.buf.iter().position(|&byte| byte == HEADER) else {
+                self.buf.clear();
+                return None;
+            };
+            if header > 0 {
+                self.buf.drain(..header);
             }
-        }
 
-        // A bogus length field would otherwise let the buffer grow forever.
-        if self.buf.len() > MAX_FRAME_LEN {
-            eprintln!("[WARN] Discarding oversized frame buffer, resynchronizing");
-            self.buf.clear();
+            if self.buf.len() < 3 {
+                return None;
+            }
+
+            let payload_len = u16::from_be_bytes([self.buf[1], self.buf[2]]) as usize;
+            let frame_len = payload_len + FRAME_OVERHEAD;
+            if frame_len > MAX_FRAME_LEN {
+                eprintln!("[WARN] Discarding oversized frame, resynchronizing");
+                self.buf.remove(0);
+                continue;
+            }
+
+            if self.buf.len() < frame_len {
+                return None;
+            }
+
+            let payload_end = frame_len - 1;
+            if payload::crc8(&self.buf[3..payload_end]) != self.buf[payload_end] {
+                eprintln!("[WARN] Discarding frame with invalid CRC");
+                self.buf.remove(0);
+                continue;
+            }
+            return Some(self.buf.drain(..frame_len).collect());
         }
-        None
     }
 
     pub fn clear(&mut self) {
@@ -346,15 +380,58 @@ impl Connection {
 
     /// Send a one-shot command and report the status byte of the reply.
     async fn command(&mut self, payload: Vec<u8>, action: &str) -> Result<()> {
-        self.subscribe(payload, |frame| {
-            match frame.get(4).copied() {
-                Some(0x00) => info!("{action} succeeded"),
-                Some(code) => eprintln!("[ERR] {action} failed, CODE: {code:#04x}"),
-                None => eprintln!("[ERR] {action} failed, frame too short"),
+        let frame = self.oneshot(payload, FrameKind::Command).await?;
+        match frame.get(4).copied() {
+            Some(0x00) => {
+                info!("{action} succeeded");
+                Ok(())
             }
-            ControlFlow::Break(())
-        })
-        .await
+            Some(code) => bail!("{action} failed, CODE: {code:#04x}"),
+            None => bail!("{action} failed, response frame too short"),
+        }
+    }
+
+    pub async fn measure_once(&mut self) -> Result<Measurement> {
+        let frame = self
+            .oneshot(payload::monitoring(), FrameKind::Measurement)
+            .await?;
+        read_measure(&frame)
+    }
+
+    async fn oneshot(&mut self, payload: Vec<u8>, kind: FrameKind) -> Result<Vec<u8>> {
+        let mut notifications = self.listen().await?;
+        if self.write(&payload).await? {
+            notifications = self.listen().await?;
+        }
+
+        let wait = async {
+            let mut assembler = FrameAssembler::new();
+            loop {
+                let Some(event) = notifications.next().await else {
+                    // The link dropped before the reply arrived, taking the
+                    // command with it: re-establish and send it again.
+                    notifications = self.reconnect_stream().await?;
+                    if self.write(&payload).await? {
+                        notifications = self.listen().await?;
+                    }
+                    assembler.clear();
+                    continue;
+                };
+                if event.uuid != C_RX {
+                    continue;
+                }
+
+                for frame in assembler.feed(&event.value) {
+                    if kind.matches(&frame) {
+                        return Ok(frame);
+                    }
+                }
+            }
+        };
+
+        tokio::time::timeout(COMMAND_TIMEOUT, wait)
+            .await
+            .map_err(|_| anyhow!("command timed out"))?
     }
 
     async fn subscribe<F>(&mut self, payload: Vec<u8>, mut on_frame: F) -> Result<()>
@@ -383,10 +460,10 @@ impl Connection {
                         continue;
                     }
 
-                    if let Some(frame) = assembler.feed(&event.value)
-                        && on_frame(&frame).is_break()
-                    {
-                        return Ok(());
+                    for frame in assembler.feed(&event.value) {
+                        if on_frame(&frame).is_break() {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -539,36 +616,69 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frame_assembler_reassembles_split_frame() {
-        let mut a = FrameAssembler::new();
-        assert_eq!(a.feed(&[HEADER, 0x00, 0x03, 0x01]), None);
-        assert_eq!(
-            a.feed(&[0x02, 0x03, 0xFF]),
-            Some(vec![HEADER, 0x00, 0x03, 0x01, 0x02, 0x03, 0xFF])
-        );
+    /// Feed one chunk and collect every frame it completes.
+    fn feed(a: &mut FrameAssembler, data: &[u8]) -> Vec<Vec<u8>> {
+        a.feed(data).collect()
     }
 
     #[test]
-    fn frame_assembler_restarts_on_new_header() {
+    fn frame_assembler_reassembles_split_frame() {
         let mut a = FrameAssembler::new();
-        assert_eq!(a.feed(&[HEADER, 0x00, 0x08, 0x01]), None);
-        // A fresh header mid-frame abandons the partial one.
-        assert_eq!(
-            a.feed(&[HEADER, 0x00, 0x01, 0x08, 0xB3]),
-            Some(vec![HEADER, 0x00, 0x01, 0x08, 0xB3])
-        );
+        let frame = payload::monitoring();
+        assert!(feed(&mut a, &frame[..4]).is_empty());
+        assert_eq!(feed(&mut a, &frame[4..]), vec![frame]);
+    }
+
+    #[test]
+    fn frame_assembler_keeps_header_at_chunk_boundary() {
+        let mut a = FrameAssembler::new();
+        let payload = [0x01, HEADER];
+        let frame = vec![
+            HEADER,
+            0x00,
+            0x02,
+            payload[0],
+            payload[1],
+            payload::crc8(&payload),
+        ];
+        assert!(feed(&mut a, &frame[..4]).is_empty());
+        assert_eq!(feed(&mut a, &frame[4..]), vec![frame]);
+    }
+
+    #[test]
+    fn frame_assembler_preserves_multiple_frames() {
+        let frame = payload::monitoring();
+        let mut a = FrameAssembler::new();
+        let chunk = [&[0x00, 0x01][..], &frame, &frame].concat();
+        assert_eq!(feed(&mut a, &chunk), vec![frame.clone(), frame]);
+    }
+
+    #[test]
+    fn frame_assembler_rejects_invalid_crc() {
+        let mut frame = payload::monitoring();
+        *frame.last_mut().unwrap() ^= 0xff;
+        let mut a = FrameAssembler::new();
+        assert!(feed(&mut a, &frame).is_empty());
+    }
+
+    #[test]
+    fn frame_assembler_recovers_after_corrupted_length() {
+        let valid = payload::monitoring();
+        let mut corrupted = payload::monitoring();
+        corrupted[2] += valid.len() as u8;
+
+        let mut a = FrameAssembler::new();
+        let chunk = [corrupted, valid.clone()].concat();
+        assert_eq!(feed(&mut a, &chunk), vec![valid]);
     }
 
     #[test]
     fn frame_assembler_discards_oversized_buffer() {
         let mut a = FrameAssembler::new();
         // Declares a payload far longer than any real frame.
-        a.feed(&[HEADER, 0xFF, 0xFF]);
-        for _ in 0..MAX_FRAME_LEN {
-            a.feed(&[0x00]);
-        }
-        assert!(a.buf.len() <= MAX_FRAME_LEN);
+        assert!(feed(&mut a, &[HEADER, 0xFF, 0xFF]).is_empty());
+        // Resynchronized rather than buffering toward the declared length.
+        assert_eq!(a.buf.len(), 0);
     }
 
     #[test]

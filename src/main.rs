@@ -8,13 +8,13 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Local;
 use clap::Parser;
 
 use agent::protocol::{Request, Response};
 use cli::{AgentAction, Cli, Command, LogLevel, Mode};
-use connection::{Connection, Measurement, ScannedDevice};
+use connection::{Connection, Measurement, ScannedDevice, info};
 use output::StreamRenderer;
 
 const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
@@ -22,13 +22,18 @@ const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = cli.load_config()?;
     let paths = cli.agent_paths();
 
     if let Some(Command::Agent { action }) = &cli.command {
+        let cfg = if matches!(action, AgentAction::Start) {
+            cli.load_config()?
+        } else {
+            None
+        };
         return run_agent_command(action, &cli, cfg.as_ref(), &paths).await;
     }
 
+    let cfg = cli.load_config()?;
     let mode = cli.mode();
 
     // Stay quiet in Mackerel mode unless --debug is given, so nothing but
@@ -51,12 +56,14 @@ async fn main() -> Result<()> {
 
     let mut conn = Connection::new(&cli.connection_config(cfg.as_ref())?).await?;
 
-    tokio::select! {
-        result = run(&mut conn, mode, &cli, log_level) => result?,
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    let result = tokio::select! {
+        result = run(&mut conn, mode, &cli, log_level) => result,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
 
-    conn.disconnect().await
+    let disconnect = conn.disconnect().await;
+    result?;
+    disconnect
 }
 
 async fn run_agent_command(
@@ -107,18 +114,12 @@ async fn run_via_daemon(
             send_daemon_command(&req, "RTC set", paths).await
         }
         Mode::GetRtc => {
-            agent::client::execute(&Request::GetRtc, paths, |resp| {
-                match resp.to_measurement() {
-                    Some(m) => print_rtc_drift(&m),
-                    None => {
-                        if let Response::Error { message } = resp {
-                            eprintln!("[ERR] {message}");
-                        }
-                    }
-                }
-                ControlFlow::Break(())
-            })
-            .await
+            let resp = agent::client::request(&Request::GetRtc, paths).await?;
+            let Some(m) = resp.to_measurement() else {
+                bail!("agent returned an unexpected RTC response");
+            };
+            print_rtc_drift(&m);
+            Ok(())
         }
         Mode::Power(on) => {
             let action = if on { "Power on" } else { "Power off" };
@@ -136,9 +137,6 @@ async fn run_via_daemon(
             let work = agent::client::execute(&Request::Subscribe, paths, |resp| {
                 if let Some(m) = resp.to_measurement() {
                     renderer.record(&m)
-                } else if let Response::Error { message } = resp {
-                    eprintln!("[ERR] {message}");
-                    ControlFlow::Break(())
                 } else {
                     ControlFlow::Continue(())
                 }
@@ -180,32 +178,26 @@ where
 }
 
 async fn send_daemon_command(req: &Request, action: &str, paths: &agent::AgentPaths) -> Result<()> {
-    agent::client::execute(req, paths, |resp| {
-        match resp {
-            Response::CommandResult { success, code } => {
-                if success {
-                    eprintln!("[INFO] {action} succeeded");
-                } else {
-                    eprintln!("[ERR] {action} failed, CODE: {:#04x}", code.unwrap_or(0xff));
-                }
+    match agent::client::request(req, paths).await? {
+        Response::CommandResult { success, code } => {
+            if success {
+                info!("{action} succeeded");
+                Ok(())
+            } else {
+                bail!("{action} failed, CODE: {:#04x}", code.unwrap_or(0xff));
             }
-            Response::Error { message } => eprintln!("[ERR] {message}"),
-            _ => {}
         }
-        ControlFlow::Break(())
-    })
-    .await
+        _ => bail!("agent returned an unexpected command response"),
+    }
 }
 
 async fn run(conn: &mut Connection, mode: Mode, cli: &Cli, log_level: LogLevel) -> Result<()> {
     match mode {
         Mode::SetRtc(time) => conn.set_rtc(&time).await,
         Mode::GetRtc => {
-            conn.subscribe_measure(|m| {
-                print_rtc_drift(&m);
-                ControlFlow::Break(())
-            })
-            .await
+            let m = conn.measure_once().await?;
+            print_rtc_drift(&m);
+            Ok(())
         }
         Mode::Power(on) => conn.power(on).await,
         Mode::TestLed => conn.blink_led().await,

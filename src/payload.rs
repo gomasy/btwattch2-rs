@@ -51,7 +51,7 @@ fn generate(payload: &[u8]) -> Vec<u8> {
 
 /// CRC-8 over the payload bytes, as the device expects: polynomial 0x85,
 /// zero initial value, no reflection. Not any catalogued standard variant.
-fn crc8(payload: &[u8]) -> u8 {
+pub(crate) fn crc8(payload: &[u8]) -> u8 {
     const POLYNOMIAL: u8 = 0x85;
 
     payload.iter().fold(0x00, |mut crc, &byte| {
