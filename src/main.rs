@@ -90,8 +90,15 @@ async fn run_agent_command(
         }
         AgentAction::Status => {
             if agent::is_daemon_available(paths).await {
-                let pid = std::fs::read_to_string(&paths.pid).unwrap_or_default();
-                println!("Agent is running (pid {})", pid.trim());
+                // The socket answered, so the agent is up even if its pid file
+                // is missing or unreadable; say so rather than print a blank.
+                let contents = std::fs::read_to_string(&paths.pid).ok();
+                let pid = contents
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|pid| !pid.is_empty())
+                    .unwrap_or("unknown");
+                println!("Agent is running (pid {pid})");
             } else {
                 println!("Agent is not running");
             }

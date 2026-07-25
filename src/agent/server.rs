@@ -100,10 +100,18 @@ async fn accept_loop(
 ) -> Result<()> {
     let sigterm = async {
         #[cfg(unix)]
-        {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
-            sig.recv().await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Losing the graceful SIGTERM path is not worth killing a working
+            // agent over: the signal keeps its default disposition (which still
+            // stops the process, just without the socket/pid cleanup), and
+            // SIGINT and `agent stop` remain unaffected.
+            Err(e) => {
+                eprintln!("[WARN] Failed to register SIGTERM handler: {e}");
+                futures::future::pending::<()>().await;
+            }
         }
         #[cfg(not(unix))]
         futures::future::pending::<()>().await;

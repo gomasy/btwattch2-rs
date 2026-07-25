@@ -492,8 +492,11 @@ impl Connection {
     /// connection was re-established along the way.
     pub(crate) async fn write(&mut self, payload: &[u8]) -> Result<bool> {
         let mut reconnected = false;
+        let mut attempt = 1;
 
-        for attempt in 1.. {
+        // `loop` rather than `for`, so the final failure leaves the loop as a
+        // value instead of needing an unreachable arm after it.
+        let error = loop {
             // Re-read every attempt: a reconnect along the way replaces `tx`.
             let write_type = if self.tx.properties.contains(CharPropFlags::WRITE) {
                 WriteType::WithResponse
@@ -512,15 +515,13 @@ impl Connection {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
+                    attempt += 1;
                 }
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("write failed after {attempt} attempts"));
-                }
+                Err(e) => break e,
             }
-        }
+        };
 
-        unreachable!()
+        Err(error).with_context(|| format!("write failed after {WRITE_RETRIES} attempts"))
     }
 }
 
