@@ -228,10 +228,6 @@ fn print_scan(devices: &[ScannedDevice]) {
     }
     for d in devices {
         let name = d.name.as_deref().unwrap_or("(unknown)");
-        let rssi = d
-            .rssi
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        println!("{}\t{}\trssi={}", d.addr, name, rssi);
+        println!("{}\t{}\trssi={}", d.addr, name, d.rssi);
     }
 }

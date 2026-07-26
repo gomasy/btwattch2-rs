@@ -53,7 +53,7 @@ Options:
 
 ### Discovering the device (`--scan`)
 
-List nearby Bluetooth devices (address, name, RSSI) without connecting. Useful for finding the `addr` to pass to the other commands.
+List nearby Bluetooth devices (address, name, RSSI) without connecting. Useful for finding the `addr` to pass to the other commands. Only devices currently advertising are listed: BlueZ also remembers everything it has ever seen, and those would otherwise pad the results with neighbours long out of range.
 
 ```console
 # btwattch2 --scan

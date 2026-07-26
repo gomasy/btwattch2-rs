@@ -76,12 +76,13 @@ pub struct Measurement {
     pub timestamp: DateTime<Local>,
 }
 
-/// A device discovered during a scan.
+/// A device discovered during a scan. Only devices currently advertising are
+/// reported, so the RSSI is always known.
 #[derive(Debug, Clone)]
 pub struct ScannedDevice {
     pub addr: BDAddr,
     pub name: Option<String>,
-    pub rssi: Option<i16>,
+    pub rssi: i16,
 }
 
 /// Which reply a one-shot write is waiting for. The two are told apart by
@@ -186,6 +187,11 @@ impl Connection {
     /// Scan for nearby Bluetooth devices for `duration` and return the unique
     /// ones seen, keyed by address. Useful for discovering the device's BD
     /// address before a first connection.
+    ///
+    /// BlueZ hands back every device it has ever seen, not just the ones in
+    /// range, so results are limited to those advertising an RSSI — the
+    /// property it drops once a device stops being discovered. Without that, a
+    /// scan lists neighbours that moved out months ago.
     pub async fn scan(index: usize, duration: Duration) -> Result<Vec<ScannedDevice>> {
         let manager = Manager::new().await?;
         let name = format!("hci{index}");
@@ -197,27 +203,25 @@ impl Connection {
             .context("failed to start scanning (is Bluetooth powered on?)")?;
 
         let deadline = tokio::time::Instant::now() + duration;
-        let mut found: HashMap<BDAddr, ScannedDevice> = HashMap::new();
+        // Every device seen, silent ones included, so the memo below can skip
+        // them. Filtering them out here instead would mean they never enter the
+        // map and so get re-polled on every tick — one D-Bus round trip per
+        // remembered device per 500 ms, which on a host with a long Bluetooth
+        // history is hundreds of pointless calls per scan.
+        let mut found: HashMap<BDAddr, (Option<String>, Option<i16>)> = HashMap::new();
         loop {
             for dev in adapter.peripherals().await? {
                 let addr = dev.address();
                 // Advertisements are fragmented: the name often arrives in a
                 // later scan response, so keep polling properties (a D-Bus
                 // round trip) until a device has one, then leave it alone.
-                if found.get(&addr).is_some_and(|d| d.name.is_some()) {
+                if found.get(&addr).is_some_and(|(name, _)| name.is_some()) {
                     continue;
                 }
                 let Some(props) = dev.properties().await? else {
                     continue;
                 };
-                found.insert(
-                    addr,
-                    ScannedDevice {
-                        addr,
-                        name: props.local_name,
-                        rssi: props.rssi,
-                    },
-                );
+                found.insert(addr, (props.local_name, props.rssi));
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
@@ -226,7 +230,16 @@ impl Connection {
         }
 
         adapter.stop_scan().await.ok();
-        Ok(found.into_values().collect())
+        Ok(found
+            .into_iter()
+            .filter_map(|(addr, (name, rssi))| {
+                Some(ScannedDevice {
+                    addr,
+                    name,
+                    rssi: rssi?,
+                })
+            })
+            .collect())
     }
 
     async fn find_adapter(manager: &Manager, name: &str) -> Result<Adapter> {
