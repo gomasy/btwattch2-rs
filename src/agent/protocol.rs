@@ -18,7 +18,12 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Pong,
+    Pong {
+        /// The device the agent is attached to. Defaulted so a ping reply from
+        /// an agent that predates the field still parses, as `None`.
+        #[serde(default)]
+        addr: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -30,8 +35,10 @@ pub enum Response {
         timestamp: i64,
     },
     CommandResult {
-        success: bool,
-        code: Option<u8>,
+        /// The device's status byte; zero means it accepted the command. Only
+        /// the code travels — a `success` flag alongside it would be derived
+        /// state that the wire could contradict.
+        code: u8,
     },
     StreamEnd,
 }
@@ -68,5 +75,63 @@ impl Response {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Local, TimeZone};
+
+    use super::*;
+
+    #[test]
+    fn measurement_survives_a_round_trip() {
+        let m = Measurement {
+            voltage: 100.5,
+            ampere: 1.25,
+            wattage: 125.0,
+            power_factor: 0.99,
+            timestamp: Local.timestamp_opt(1609304963, 0).unwrap(),
+        };
+        let json = serde_json::to_string(&Response::from_measurement(&m)).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let back = back.to_measurement().unwrap();
+
+        assert_eq!(back.voltage, m.voltage);
+        assert_eq!(back.ampere, m.ampere);
+        assert_eq!(back.wattage, m.wattage);
+        assert_eq!(back.power_factor, m.power_factor);
+        assert_eq!(back.timestamp, m.timestamp);
+    }
+
+    /// `to_measurement` is how clients recognise a measurement reply, so every
+    /// other variant has to yield `None` rather than a bogus reading.
+    #[test]
+    fn other_responses_are_not_measurements() {
+        for resp in [
+            Response::Ok,
+            Response::Pong { addr: None },
+            Response::StreamEnd,
+            Response::CommandResult { code: 0 },
+        ] {
+            assert!(resp.to_measurement().is_none(), "{resp:?}");
+        }
+    }
+
+    /// A pong from an agent that predates the `addr` field must still parse.
+    #[test]
+    fn pong_without_an_address_parses() {
+        let resp: Response = serde_json::from_str(r#"{"type":"pong"}"#).unwrap();
+        assert!(matches!(resp, Response::Pong { addr: None }));
+    }
+
+    #[test]
+    fn requests_are_tagged_by_cmd() {
+        let json = serde_json::to_string(&Request::Power { on: true }).unwrap();
+        assert_eq!(json, r#"{"cmd":"power","on":true}"#);
+        assert!(matches!(
+            serde_json::from_str(r#"{"cmd":"subscribe"}"#).unwrap(),
+            Request::Subscribe
+        ));
     }
 }

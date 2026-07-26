@@ -238,6 +238,13 @@ impl Cli {
         )
     }
 
+    /// The address named on the command line, ignoring the config file. Only an
+    /// explicit one means "this device and no other"; a configured one is a
+    /// default that a running agent legitimately supersedes.
+    pub fn explicit_addr(&self) -> Option<BDAddr> {
+        self.connect.addr
+    }
+
     pub fn mode(&self) -> Mode {
         if self.get_rtc {
             Mode::GetRtc
@@ -616,6 +623,25 @@ mod tests {
         ] {
             assert!(!parse_cli(&args).is_agent_start(), "claimed {args:?}");
         }
+    }
+
+    #[test]
+    fn explicit_addr_ignores_the_config_file() {
+        let cfg = ConnectOpts {
+            addr: Some("CB:DF:6B:12:34:56".parse().unwrap()),
+            ..ConnectOpts::default()
+        };
+        // Only what the command line asked for counts, so a configured address
+        // never makes a running agent look like the wrong device.
+        assert_eq!(parse_cli(&[]).explicit_addr(), None);
+        assert_eq!(
+            parse_cli(&["-a", "CB:DF:6B:AA:BB:CC"]).explicit_addr(),
+            "CB:DF:6B:AA:BB:CC".parse().ok()
+        );
+        assert_eq!(
+            parse_cli(&[]).connection_config(Some(&cfg)).unwrap().addr,
+            cfg.addr.unwrap()
+        );
     }
 
     #[test]

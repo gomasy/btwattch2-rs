@@ -110,6 +110,8 @@ Every format but `plain` emits values at full precision and leaves rounding to w
 
 - `mackerel` — Mackerel custom metrics, line-per-metric (used with `--metric-name`).
 
+`--metric-name` accepts a letter or `_` followed by letters, digits, `_`, `.`, or `-`. The `prometheus` format is stricter still and rejects `.` and `-`, since a metric name carrying either produces an exposition no scraper will parse.
+
 ### Limiting a run (`--count`, `--duration`)
 
 Stop automatically instead of waiting for Ctrl-C. Handy for cron/systemd-timer or periodic sampling.
@@ -187,6 +189,27 @@ The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` i
 The pid file is derived from the socket path by extension (`btwattch2.sock` → `btwattch2.pid`) by default, so usually you only set the socket. Override it independently with `--pid-file <path>` if you need the pid elsewhere. Run multiple agents on separate sockets (and pid files) to manage several devices at once.
 
 When the agent is running, CLI commands detect it and route through the socket. When it is not running, they fall back to direct BLE as before — no flags needed.
+
+Because the agent holds the connection, its `--addr`, `--index`, and `--interval` are fixed at `agent start` and a client cannot change them. `--index` and `--interval` on a client are ignored with a warning. An explicit `--addr` naming a *different* device is an error rather than a warning — otherwise a command meant for one meter would silently operate another:
+
+```console
+# btwattch2 --addr CB:DF:6B:AA:BB:CC --off
+Error: the agent on /run/btwattch2/btwattch2.sock is attached to CB:DF:6B:12:34:56, but
+--addr asks for CB:DF:6B:AA:BB:CC; stop that agent or point --socket at the one holding it
+```
+
+Under systemd, let the unit own the runtime directory rather than relying on the fallback:
+
+```ini
+[Service]
+RuntimeDirectory=btwattch2
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
+```
+
+The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM.
+
+> **Upgrading:** the socket protocol changed, so **restart the agent when you replace the binary**. A client and an agent from different versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected.
 
 ### Configuration file
 

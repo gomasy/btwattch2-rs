@@ -7,6 +7,7 @@ mod signal;
 
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -15,7 +16,7 @@ use clap::Parser;
 
 use agent::protocol::{Request, Response};
 use cli::{AgentAction, Cli, Command, LogLevel, Mode};
-use connection::{Connection, Measurement, ScannedDevice, info};
+use connection::{Connection, Measurement, ScannedDevice};
 use output::StreamRenderer;
 use signal::Sigpipe;
 
@@ -68,7 +69,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    if agent::is_daemon_available(&paths).await {
+    if let Some(daemon) = agent::probe_daemon(&paths).await {
+        ensure_addr_matches(&cli, &daemon, &paths.socket)?;
+        warn_ignored_flags(&cli);
         return run_via_daemon(mode, &cli, log_level, &paths).await;
     }
 
@@ -82,6 +85,40 @@ async fn run_cli(cli: Cli) -> Result<()> {
     let disconnect = conn.disconnect().await;
     result?;
     disconnect
+}
+
+/// Stop before handing a command to an agent attached to some other device.
+/// Routing is automatic, so without this check `--addr <B>` while an agent
+/// holds device A quietly operates A instead — on a mains switch that is not a
+/// mistake worth making twice.
+fn ensure_addr_matches(cli: &Cli, daemon: &agent::DaemonInfo, socket: &Path) -> Result<()> {
+    let (Some(want), Some(have)) = (cli.explicit_addr(), daemon.addr) else {
+        return Ok(());
+    };
+    if want != have {
+        bail!(
+            "the agent on {} is attached to {have}, but --addr asks for {want}; \
+             stop that agent or point --socket at the one holding {want}",
+            socket.display()
+        );
+    }
+    Ok(())
+}
+
+/// Note the options the agent decides for itself. Not an error: unlike the
+/// address, getting one of these wrong cannot operate the wrong device.
+fn warn_ignored_flags(cli: &Cli) {
+    let warn = |flag: &str| {
+        eprintln!(
+            "[WARN] {flag} is ignored while the agent is running; the value it was started with applies"
+        );
+    };
+    if cli.connect.interval.is_some() {
+        warn("--interval");
+    }
+    if cli.connect.index.is_some() {
+        warn("--index");
+    }
 }
 
 async fn run_agent_command(
@@ -98,7 +135,7 @@ async fn run_agent_command(
             agent::server::run(&conn_cfg, paths).await
         }
         AgentAction::Stop => {
-            if !agent::is_daemon_available(paths).await {
+            if agent::probe_daemon(paths).await.is_none() {
                 eprintln!("Agent is not running");
                 return Ok(());
             }
@@ -107,7 +144,7 @@ async fn run_agent_command(
             Ok(())
         }
         AgentAction::Status => {
-            if agent::is_daemon_available(paths).await {
+            if let Some(daemon) = agent::probe_daemon(paths).await {
                 // The socket answered, so the agent is up even if its pid file
                 // is missing or unreadable; say so rather than print a blank.
                 let contents = std::fs::read_to_string(&paths.pid).ok();
@@ -117,6 +154,9 @@ async fn run_agent_command(
                     .filter(|pid| !pid.is_empty())
                     .unwrap_or("unknown");
                 println!("Agent is running (pid {pid})");
+                if let Some(addr) = daemon.addr {
+                    println!("Attached to {addr}");
+                }
             } else {
                 println!("Agent is not running");
             }
@@ -204,14 +244,7 @@ where
 
 async fn send_daemon_command(req: &Request, action: &str, paths: &agent::AgentPaths) -> Result<()> {
     match agent::client::request(req, paths).await? {
-        Response::CommandResult { success, code } => {
-            if success {
-                info!("{action} succeeded");
-                Ok(())
-            } else {
-                bail!("{action} failed, CODE: {:#04x}", code.unwrap_or(0xff));
-            }
-        }
+        Response::CommandResult { code } => connection::report_command(action, code),
         _ => bail!("agent returned an unexpected command response"),
     }
 }

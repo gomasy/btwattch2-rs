@@ -1,12 +1,15 @@
 use std::future::Future;
+use std::io::Write;
 use std::ops::ControlFlow;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use btleplug::api::ValueNotification;
+use btleplug::api::{BDAddr, ValueNotification};
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 
 use super::protocol::{Request, Response};
@@ -21,25 +24,45 @@ struct ActorCommand {
     tx: mpsc::UnboundedSender<Response>,
 }
 
+/// Owns the socket and pid file for as long as the agent is serving. Every exit
+/// path below — an early `?`, a signal during the initial connect, `agent stop`
+/// — has to take both files with it, and a guard is the only way to say that
+/// once rather than at each `return`. Removal only; whether the agent stopped
+/// cleanly or never got going is `run`'s to report, not a destructor's.
+struct AgentFiles<'a>(&'a super::AgentPaths);
+
+impl Drop for AgentFiles<'_> {
+    fn drop(&mut self) {
+        self.0.remove_files();
+    }
+}
+
 pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result<()> {
     let sock = &paths.socket;
-    let pid_file = &paths.pid;
+
+    // Register before creating anything, so no window exists where a signal
+    // still has its default disposition and kills the process between the bind
+    // and the guard below. Nothing polls these until the connect, which is fine:
+    // a signal arriving earlier is queued rather than lost.
+    let mut signals = Shutdown::new();
 
     cleanup_stale(paths).await?;
+    ensure_socket_dir(sock)?;
     let listener =
         UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?;
-    if let Err(e) = std::fs::write(pid_file, std::process::id().to_string()) {
-        std::fs::remove_file(sock).ok();
-        return Err(e).with_context(|| format!("failed to write {}", pid_file.display()));
-    }
+    let _files = AgentFiles(paths);
+    write_pid_file(&paths.pid)?;
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
-    let conn = match Connection::new(config).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            cleanup_files(sock, pid_file);
-            return Err(e);
+    // Connecting can take tens of seconds of scanning and retries. Watch for a
+    // signal throughout, so a Ctrl-C here runs the cleanup above instead of
+    // killing the process outright and stranding the socket and pid file.
+    let conn = tokio::select! {
+        result = Connection::new(config) => result?,
+        reason = signals.recv() => {
+            eprintln!("[INFO] Received {reason} while connecting, shutting down...");
+            return Ok(());
         }
     };
 
@@ -53,9 +76,8 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
 
     let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone()));
     let result = tokio::select! {
-        result = accept_loop(listener, cmd_tx.clone(), shutdown) => result,
+        result = accept_loop(listener, cmd_tx.clone(), shutdown, config.addr, signals) => result,
         actor_result = &mut actor => {
-            cleanup_files(sock, pid_file);
             actor_result.context("agent actor failed")?;
             bail!("agent actor stopped unexpectedly");
         }
@@ -64,59 +86,127 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     actor_shutdown.notify_one();
     drop(cmd_tx);
     actor.await.ok();
-    cleanup_files(sock, pid_file);
+    // Reached only after the agent actually served, so a startup failure no
+    // longer reports a clean stop on its way out.
+    eprintln!("[INFO] Agent stopped");
     result
 }
 
-/// Refuse to start when a previous agent is still alive, and clear its leftover
-/// files when it is not. The pid check is a free `/proc` stat, so the socket
-/// round trip is only worth paying for when there is no usable pid file left.
-async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
-    if let Ok(pid_str) = std::fs::read_to_string(&paths.pid)
-        && let Ok(pid) = pid_str.trim().parse::<u32>()
-    {
-        if Path::new(&format!("/proc/{pid}")).exists() {
-            bail!("agent is already running (pid {pid})");
+/// The signals that end the agent, registered once so no window exists in which
+/// one arrives with nothing listening for it.
+struct Shutdown {
+    interrupt: Option<Signal>,
+    terminate: Option<Signal>,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        Self {
+            interrupt: Self::register(SignalKind::interrupt()),
+            terminate: Self::register(SignalKind::terminate()),
         }
-    } else if paths.socket.exists() && super::client::ping(paths).await.is_ok() {
+    }
+
+    /// Losing a graceful signal path is not worth refusing to start over: the
+    /// signal keeps its default disposition, which still stops the process,
+    /// just without the socket and pid file cleanup.
+    fn register(kind: SignalKind) -> Option<Signal> {
+        match signal(kind) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                eprintln!("[WARN] Failed to register handler for signal {kind:?}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Wait for whichever arrives first, naming it for the log line.
+    async fn recv(&mut self) -> &'static str {
+        let interrupt = Self::wait(self.interrupt.as_mut());
+        let terminate = Self::wait(self.terminate.as_mut());
+        tokio::select! {
+            _ = interrupt => "SIGINT",
+            _ = terminate => "SIGTERM",
+        }
+    }
+
+    /// A signal that failed to register simply never fires.
+    async fn wait(sig: Option<&mut Signal>) {
+        match sig {
+            Some(sig) => {
+                sig.recv().await;
+            }
+            None => futures::future::pending().await,
+        }
+    }
+}
+
+/// Refuse to start when a previous agent is still alive, and clear its leftover
+/// files when it is not.
+///
+/// A live pid is not proof on its own — pids get recycled, and a leftover file
+/// naming an unrelated process must not lock the agent out of ever starting
+/// again — so it counts only when it still belongs to a btwattch2. That check is
+/// a cheap `/proc` read taken first; a socket that answers is the authority and
+/// is consulted whenever the pid file leaves any doubt, including when it names
+/// a process that is not ours. Skipping the socket in that case would let a
+/// second agent unlink a live one's socket and fight it for the device.
+async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
+    if let Some(pid) = paths.read_pid().filter(|&pid| is_agent_process(pid)) {
+        bail!("agent is already running (pid {pid})");
+    }
+    if super::probe_daemon(paths).await.is_some() {
         bail!("agent is already running");
     }
 
-    std::fs::remove_file(&paths.socket).ok();
-    std::fs::remove_file(&paths.pid).ok();
+    paths.remove_files();
     Ok(())
 }
 
-fn cleanup_files(sock: &Path, pid_file: &Path) {
-    std::fs::remove_file(sock).ok();
-    std::fs::remove_file(pid_file).ok();
-    eprintln!("[INFO] Agent stopped");
+/// Whether `pid` names a live process running this same program. Comparing
+/// `comm` is what tells a still-running agent apart from a recycled pid.
+fn is_agent_process(pid: u32) -> bool {
+    let ours = std::fs::read_to_string("/proc/self/comm");
+    let theirs = std::fs::read_to_string(format!("/proc/{pid}/comm"));
+    matches!((ours, theirs), (Ok(ours), Ok(theirs)) if ours == theirs)
+}
+
+/// Create the socket's parent directory, private to us. The default runtime
+/// directory does not exist until the first agent start; an existing directory
+/// (including one an explicit `--socket` points into) is left as it is.
+fn ensure_socket_dir(sock: &Path) -> Result<()> {
+    let Some(dir) = sock.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))
+}
+
+/// Write the pid file, refusing to follow a symlink. `--pid-file` can name any
+/// path, so an attacker who can predict it must not be able to turn the write
+/// into a clobber of an unrelated file the agent happens to be able to write.
+fn write_pid_file(path: &Path) -> Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(std::process::id().to_string().as_bytes()))
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 async fn accept_loop(
     listener: UnixListener,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown: std::sync::Arc<Notify>,
+    addr: BDAddr,
+    mut signals: Shutdown,
 ) -> Result<()> {
-    let sigterm = async {
-        #[cfg(unix)]
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            // Losing the graceful SIGTERM path is not worth killing a working
-            // agent over: the signal keeps its default disposition (which still
-            // stops the process, just without the socket/pid cleanup), and
-            // SIGINT and `agent stop` remain unaffected.
-            Err(e) => {
-                eprintln!("[WARN] Failed to register SIGTERM handler: {e}");
-                futures::future::pending::<()>().await;
-            }
-        }
-        #[cfg(not(unix))]
-        futures::future::pending::<()>().await;
-    };
-
     tokio::select! {
         _ = async {
             loop {
@@ -124,7 +214,7 @@ async fn accept_loop(
                     Ok((stream, _)) => {
                         let tx = cmd_tx.clone();
                         let shutdown = shutdown.clone();
-                        tokio::spawn(handle_client(stream, tx, shutdown));
+                        tokio::spawn(handle_client(stream, tx, shutdown, addr));
                     }
                     Err(e) => {
                         eprintln!("[WARN] Accept failed: {e}");
@@ -132,11 +222,8 @@ async fn accept_loop(
                 }
             }
         } => {}
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\n[INFO] Received SIGINT, shutting down...");
-        }
-        _ = sigterm => {
-            eprintln!("[INFO] Received SIGTERM, shutting down...");
+        reason = signals.recv() => {
+            eprintln!("[INFO] Received {reason}, shutting down...");
         }
         _ = shutdown.notified() => {
             eprintln!("[INFO] Shutdown requested, shutting down...");
@@ -149,6 +236,7 @@ async fn handle_client(
     stream: UnixStream,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown: std::sync::Arc<Notify>,
+    addr: BDAddr,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -169,7 +257,7 @@ async fn handle_client(
         }
     };
 
-    if let Some(response) = control_response(&request, cmd_tx.is_closed()) {
+    if let Some(response) = control_response(&request, cmd_tx.is_closed(), addr) {
         if send_response(&mut writer, &response).await.is_ok()
             && matches!(request, Request::Shutdown)
         {
@@ -205,12 +293,16 @@ async fn handle_client(
 /// The requests the connection handler answers itself, so `agent status` and
 /// `agent stop` stay responsive while the actor is busy on the BLE link.
 /// `None` means the request is actor-bound work.
-fn control_response(request: &Request, actor_gone: bool) -> Option<Response> {
+fn control_response(request: &Request, actor_gone: bool, addr: BDAddr) -> Option<Response> {
     match request {
         Request::Ping if actor_gone => Some(Response::Error {
             message: "agent actor is not running".to_string(),
         }),
-        Request::Ping => Some(Response::Pong),
+        // The address rides along on the pong so a client can tell whether the
+        // agent it found is holding the device its --addr asked for.
+        Request::Ping => Some(Response::Pong {
+            addr: Some(addr.to_string()),
+        }),
         Request::Shutdown => Some(Response::Ok),
         _ => None,
     }
@@ -339,17 +431,43 @@ impl Actor {
         }
     }
 
+    /// Forget the current stream, returning the client that was on it. Every
+    /// path that gives up on streaming goes through here, so what "torn down"
+    /// means stays in one place.
+    fn drop_stream(&mut self) -> Option<mpsc::UnboundedSender<Response>> {
+        self.notifications = None;
+        self.streaming_client.take()
+    }
+
     /// Tear the streaming state down and report the failure to the client.
     fn abort_stream(&mut self, reason: StreamError) {
         eprintln!("[ERR] {reason}");
-        if let Some(tx) = self.streaming_client.take() {
+        if let Some(tx) = self.drop_stream() {
             tx.send(Response::Error { message: reason }).ok();
         }
-        self.notifications = None;
+    }
+
+    /// Drop a streaming client that has hung up. The actor otherwise only finds
+    /// out when the next measurement fails to send, which leaves `Subscribe`
+    /// rejecting a new client for up to a full interval — long enough for two
+    /// back-to-back `--metric-name` runs to collide.
+    fn reap_streaming_client(&mut self) {
+        if self
+            .streaming_client
+            .as_ref()
+            .is_some_and(|tx| tx.is_closed())
+        {
+            self.drop_stream();
+        }
     }
 
     /// Ask the device for a measurement. Only runs while a client is streaming.
     async fn poll_device(&mut self) {
+        self.reap_streaming_client();
+        if self.streaming_client.is_none() {
+            return;
+        }
+
         match self.conn.write(&self.monitoring_payload).await {
             // A reconnect along the way invalidated the old subscription.
             Ok(true) => {
@@ -381,21 +499,26 @@ impl Actor {
             return;
         };
 
+        let mut hung_up = false;
         for frame in self.assembler.feed(&event.value) {
             let Some(m) = connection::try_measurement(&frame) else {
                 continue;
             };
             // The client hung up mid-stream.
             if tx.send(Response::from_measurement(&m)).is_err() {
-                self.streaming_client = None;
-                self.notifications = None;
+                hung_up = true;
                 break;
             }
+        }
+        if hung_up {
+            self.drop_stream();
         }
     }
 
     /// Serve one client request.
     async fn handle(&mut self, cmd: ActorCommand) {
+        self.reap_streaming_client();
+
         match cmd.request {
             // `handle_client` answers these itself so they stay responsive
             // while the actor is busy on the link; they never reach here.
@@ -486,16 +609,53 @@ impl Actor {
             Err(e) => return Err(format!("write failed: {e}")),
         }
 
-        wait_for_frame(&mut self.notifications, kind).await
+        self.wait_for_frame(kind).await
+    }
+
+    /// Read notifications until one reassembles into a frame of the expected
+    /// kind. Measurement and command replies are told apart by length, since a
+    /// streaming measurement can arrive while a one-shot command is in flight;
+    /// those are forwarded to the streaming client rather than dropped.
+    ///
+    /// This shares `self.assembler` rather than using a local one on purpose. A
+    /// second assembler would split a part-received frame across the two, and
+    /// both halves would then have to resynchronize on CRC failures — a burst
+    /// of warnings and dropped samples every time a command interrupts a
+    /// stream.
+    async fn wait_for_frame(&mut self, kind: FrameKind) -> Result<Vec<u8>, StreamError> {
+        // Destructured so the three fields can be borrowed independently: the
+        // stream and assembler mutably, the client for the forwarding closure.
+        let Self {
+            notifications,
+            assembler,
+            streaming_client,
+            ..
+        } = self;
+        let Some(notifications) = notifications.as_mut() else {
+            return Err("no notification stream".to_string());
+        };
+
+        let wait = connection::next_matching_frame(notifications, assembler, &kind, |frame| {
+            if let Some(tx) = &*streaming_client
+                && let Some(m) = connection::try_measurement(frame)
+            {
+                // A hung-up client is reaped on the next request; here the
+                // command reply is what matters.
+                tx.send(Response::from_measurement(&m)).ok();
+            }
+        });
+
+        match tokio::time::timeout(COMMAND_TIMEOUT, wait).await {
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => Err("notification stream closed".to_string()),
+            Err(_) => Err("command timed out".to_string()),
+        }
     }
 }
 
 fn parse_command_result(frame: &[u8]) -> Response {
-    match frame.get(4).copied() {
-        Some(code) => Response::CommandResult {
-            success: code == 0x00,
-            code: Some(code),
-        },
+    match connection::command_status(frame) {
+        Some(code) => Response::CommandResult { code },
         None => Response::Error {
             message: "response frame too short".to_string(),
         },
@@ -511,41 +671,88 @@ fn reply(tx: &mpsc::UnboundedSender<Response>, result: Result<Response, StreamEr
     tx.send(resp).ok();
 }
 
-/// Read notifications until one reassembles into a frame of the expected kind.
-/// Measurement and command replies are told apart by length, since a streaming
-/// measurement can arrive while a one-shot command is in flight.
-async fn wait_for_frame(
-    notifications: &mut Option<Notifications>,
-    kind: FrameKind,
-) -> Result<Vec<u8>, StreamError> {
-    if notifications.is_none() {
-        return Err("no notification stream".to_string());
-    }
-
-    let mut assembler = FrameAssembler::new();
-    let wait = async {
-        loop {
-            let Some(event) = next_notification(notifications).await else {
-                return Err("notification stream closed".to_string());
-            };
-            if event.uuid != connection::C_RX {
-                continue;
-            }
-            for frame in assembler.feed(&event.value) {
-                if kind.matches(&frame) {
-                    return Ok(frame);
-                }
-            }
-        }
-    };
-
-    tokio::time::timeout(COMMAND_TIMEOUT, wait)
-        .await
-        .unwrap_or(Err("command timed out".to_string()))
-}
-
 fn end_stream(client: &mut Option<mpsc::UnboundedSender<Response>>) {
     if let Some(tx) = client.take() {
         tx.send(Response::StreamEnd).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::super::testutil::TempPath;
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("path exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn pid_file_is_written_private() {
+        let temp = TempPath::new(".pid");
+        write_pid_file(temp.path()).unwrap();
+
+        let paths = super::super::paths_from_socket(temp.path().with_extension("sock"));
+        assert_eq!(paths.read_pid(), Some(std::process::id()));
+        assert_eq!(mode_of(temp.path()), 0o600);
+    }
+
+    /// `cleanup_stale` normally unlinks a planted symlink before we get here.
+    /// O_NOFOLLOW covers the case where it cannot — a symlink planted in the
+    /// window between the two, or a directory whose entries we may not remove.
+    #[test]
+    fn pid_file_refuses_to_follow_a_symlink() {
+        let temp = TempPath::new(".pid");
+        let victim = temp.sibling(".victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, temp.path()).unwrap();
+
+        assert!(write_pid_file(temp.path()).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    }
+
+    /// A pid file holding anything but a number is the same as none at all.
+    #[test]
+    fn unparsable_pid_file_reads_as_absent() {
+        let temp = TempPath::new(".pid");
+        let paths = super::super::paths_from_socket(temp.path().with_extension("sock"));
+
+        std::fs::write(temp.path(), b"  4321\n").unwrap();
+        assert_eq!(paths.read_pid(), Some(4321));
+
+        for junk in ["", "   ", "not-a-pid", "-1"] {
+            std::fs::write(temp.path(), junk).unwrap();
+            assert_eq!(paths.read_pid(), None, "accepted {junk:?}");
+        }
+    }
+
+    #[test]
+    fn our_own_pid_is_recognised_as_an_agent() {
+        assert!(is_agent_process(std::process::id()));
+    }
+
+    /// The check that keeps a recycled pid in a leftover file from locking the
+    /// agent out for good. Pid 1 is always live and never a btwattch2.
+    #[test]
+    fn an_unrelated_live_process_is_not_an_agent() {
+        assert!(!is_agent_process(1));
+    }
+
+    #[test]
+    fn socket_dir_is_created_private() {
+        let temp = TempPath::new(".d");
+        let sock = temp.path().join("deeper/a.sock");
+        let dir = sock.parent().expect("socket path has a parent");
+
+        ensure_socket_dir(&sock).unwrap();
+        assert_eq!(mode_of(dir), 0o700);
+
+        // An existing directory is accepted as it is, not re-permissioned.
+        ensure_socket_dir(&sock).unwrap();
     }
 }

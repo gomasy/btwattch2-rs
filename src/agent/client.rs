@@ -2,6 +2,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use btleplug::api::BDAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -58,12 +59,18 @@ pub async fn request(request: &Request, paths: &super::AgentPaths) -> Result<Res
     response.context("agent returned no response")
 }
 
-pub async fn ping(paths: &super::AgentPaths) -> Result<()> {
+/// Ping the agent, returning the device it reports being attached to. `None`
+/// means the agent answered but did not name one.
+pub async fn ping(paths: &super::AgentPaths) -> Result<Option<BDAddr>> {
     let response = tokio::time::timeout(Duration::from_millis(500), request(&Request::Ping, paths))
         .await
         .map_err(|_| anyhow::anyhow!("agent ping timed out"))??;
     match response {
-        Response::Pong => Ok(()),
+        Response::Pong { addr } => addr
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .context("agent reported an unparsable address"),
         _ => bail!("agent returned an unexpected ping response"),
     }
 }
@@ -84,34 +91,23 @@ async fn connect(paths: &super::AgentPaths) -> Result<UnixStream> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use tokio::net::UnixListener;
 
+    use super::super::testutil::TempPath;
     use super::*;
 
-    static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
-
-    struct SocketGuard(std::path::PathBuf);
-
-    impl Drop for SocketGuard {
-        fn drop(&mut self) {
-            std::fs::remove_file(&self.0).ok();
-        }
+    /// A socket path plus the guard that removes it; both must stay alive for
+    /// the duration of the test.
+    fn test_paths() -> (super::super::AgentPaths, TempPath) {
+        let temp = TempPath::new(".sock");
+        (
+            super::super::paths_from_socket(temp.path().to_path_buf()),
+            temp,
+        )
     }
 
-    fn test_paths() -> super::super::AgentPaths {
-        let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
-        let socket = std::env::temp_dir().join(format!(
-            "btwattch2-client-test-{}-{id}.sock",
-            std::process::id()
-        ));
-        super::super::paths_from_socket(socket)
-    }
-
-    async fn run_ping_test(response: Option<Response>) -> Result<()> {
-        let paths = test_paths();
-        let _socket = SocketGuard(paths.socket.clone());
+    async fn run_ping_test(response: Option<Response>) -> Result<Option<BDAddr>> {
+        let (paths, _temp) = test_paths();
         let listener = UnixListener::bind(&paths.socket)?;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -134,8 +130,51 @@ mod tests {
 
     #[tokio::test]
     async fn ping_requires_pong() {
-        assert!(run_ping_test(Some(Response::Pong)).await.is_ok());
+        assert!(
+            run_ping_test(Some(Response::Pong { addr: None }))
+                .await
+                .is_ok()
+        );
         assert!(run_ping_test(Some(Response::Ok)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ping_reports_the_agent_address() {
+        let addr = "CB:DF:6B:12:34:56";
+        let response = Response::Pong {
+            addr: Some(addr.to_string()),
+        };
+        assert_eq!(
+            run_ping_test(Some(response)).await.unwrap(),
+            Some(addr.parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_an_unparsable_address() {
+        let response = Response::Pong {
+            addr: Some("not-an-address".to_string()),
+        };
+        assert!(run_ping_test(Some(response)).await.is_err());
+    }
+
+    /// A ping reply from an agent that predates the `addr` field must still
+    /// parse, rather than making the agent look absent.
+    #[tokio::test]
+    async fn ping_accepts_a_reply_without_an_address() {
+        let (paths, _temp) = test_paths();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            stream.write_all(b"{\"type\":\"pong\"}\n").await.ok();
+        });
+
+        assert_eq!(ping(&paths).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -56,6 +56,8 @@ pub(crate) fn info_enabled() -> bool {
 
 // Print an informational message to stderr, only when --log-level allows it.
 // Warnings and errors are printed unconditionally with plain `eprintln!`.
+// Not exported: every `[INFO]` line about the device now originates in this
+// module, `report_command` included, so nothing outside it needs the macro.
 macro_rules! info {
     ($($arg:tt)*) => {
         if $crate::connection::info_enabled() {
@@ -63,7 +65,6 @@ macro_rules! info {
         }
     };
 }
-pub(crate) use info;
 
 #[derive(Debug)]
 pub struct Measurement {
@@ -393,14 +394,10 @@ impl Connection {
     /// Send a one-shot command and report the status byte of the reply.
     async fn command(&mut self, payload: Vec<u8>, action: &str) -> Result<()> {
         let frame = self.oneshot(payload, FrameKind::Command).await?;
-        match frame.get(4).copied() {
-            Some(0x00) => {
-                info!("{action} succeeded");
-                Ok(())
-            }
-            Some(code) => bail!("{action} failed, CODE: {code:#04x}"),
-            None => bail!("{action} failed, response frame too short"),
-        }
+        let Some(code) = command_status(&frame) else {
+            bail!("{action} failed, response frame too short");
+        };
+        report_command(action, code)
     }
 
     pub async fn measure_once(&mut self) -> Result<Measurement> {
@@ -419,25 +416,20 @@ impl Connection {
         let wait = async {
             let mut assembler = FrameAssembler::new();
             loop {
-                let Some(event) = notifications.next().await else {
-                    // The link dropped before the reply arrived, taking the
-                    // command with it: re-establish and send it again.
-                    notifications = self.reconnect_stream().await?;
-                    if self.write(&payload).await? {
-                        notifications = self.listen().await?;
-                    }
-                    assembler.clear();
-                    continue;
-                };
-                if event.uuid != C_RX {
-                    continue;
+                // Nothing else is listening, so a frame of the wrong kind here
+                // has no owner to forward it to.
+                if let Some(frame) =
+                    next_matching_frame(&mut notifications, &mut assembler, &kind, |_| {}).await
+                {
+                    return Ok(frame);
                 }
-
-                for frame in assembler.feed(&event.value) {
-                    if kind.matches(&frame) {
-                        return Ok(frame);
-                    }
+                // The link dropped before the reply arrived, taking the command
+                // with it: re-establish and send it again.
+                notifications = self.reconnect_stream().await?;
+                if self.write(&payload).await? {
+                    notifications = self.listen().await?;
                 }
+                assembler.clear();
             }
         };
 
@@ -534,6 +526,52 @@ impl Connection {
         };
 
         Err(error).with_context(|| format!("write failed after {WRITE_RETRIES} attempts"))
+    }
+}
+
+/// The device's status byte from a one-shot command reply, or `None` if the
+/// frame is too short to carry one. Kept here with the rest of the wire layout
+/// so the agent does not need its own copy of the offset.
+pub(crate) fn command_status(frame: &[u8]) -> Option<u8> {
+    frame.get(4).copied()
+}
+
+/// Turn a status byte into this command's result. Shared so the direct-BLE path
+/// and the agent-relayed path word success and failure identically.
+pub(crate) fn report_command(action: &str, code: u8) -> Result<()> {
+    if code == 0x00 {
+        info!("{action} succeeded");
+        Ok(())
+    } else {
+        bail!("{action} failed, CODE: {code:#04x}")
+    }
+}
+
+/// Drive `notifications` through `assembler` until a frame of `kind` arrives,
+/// handing every other completed frame to `on_other`. `None` means the stream
+/// ended — the caller decides whether that is worth reconnecting for (a one-shot
+/// command) or fatal (the agent's actor), which is the only thing the two
+/// callers disagree about.
+///
+/// Not wrapped in a timeout: the agent bounds a single wait, while a one-shot
+/// bounds the whole reconnect-and-retry sequence around it.
+pub(crate) async fn next_matching_frame(
+    notifications: &mut Notifications,
+    assembler: &mut FrameAssembler,
+    kind: &FrameKind,
+    mut on_other: impl FnMut(&[u8]),
+) -> Option<Vec<u8>> {
+    loop {
+        let event = notifications.next().await?;
+        if event.uuid != C_RX {
+            continue;
+        }
+        for frame in assembler.feed(&event.value) {
+            if kind.matches(&frame) {
+                return Some(frame);
+            }
+            on_other(&frame);
+        }
     }
 }
 
@@ -704,5 +742,97 @@ mod tests {
     #[test]
     fn read_measure_rejects_short_frame() {
         assert!(read_measure(&[0xAA, 0x00, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn command_status_reads_the_status_byte() {
+        assert_eq!(
+            command_status(&[HEADER, 0x00, 0x01, 0x00, 0x2A]),
+            Some(0x2A)
+        );
+        assert_eq!(command_status(&[HEADER, 0x00, 0x01, 0x00]), None);
+    }
+
+    /// A well-formed frame long enough to count as a measurement.
+    fn measurement_frame() -> Vec<u8> {
+        let payload = vec![0u8; MEASUREMENT_FRAME_MIN_LEN - FRAME_OVERHEAD];
+        let mut frame = vec![HEADER];
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame.push(payload::crc8(&payload));
+        frame
+    }
+
+    fn stream(chunks: Vec<(Uuid, Vec<u8>)>) -> Notifications {
+        Box::pin(futures::stream::iter(chunks.into_iter().map(
+            |(uuid, value)| ValueNotification {
+                uuid,
+                service_uuid: Uuid::nil(),
+                value,
+            },
+        )))
+    }
+
+    /// Collects what `next_matching_frame` yields for `kind`, plus every frame
+    /// it handed to `on_other`.
+    async fn wait(
+        chunks: Vec<(Uuid, Vec<u8>)>,
+        kind: FrameKind,
+    ) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut notifications = stream(chunks);
+        let mut assembler = FrameAssembler::new();
+        let mut others = Vec::new();
+        let found = next_matching_frame(&mut notifications, &mut assembler, &kind, |frame| {
+            others.push(frame.to_vec())
+        })
+        .await;
+        (found, others)
+    }
+
+    #[tokio::test]
+    async fn next_matching_frame_returns_the_first_match() {
+        let wanted = measurement_frame();
+        let (found, others) = wait(vec![(C_RX, wanted.clone())], FrameKind::Measurement).await;
+        assert_eq!(found, Some(wanted));
+        assert!(others.is_empty());
+    }
+
+    /// The behaviour the agent depends on: a measurement arriving while a
+    /// command is in flight goes to `on_other` rather than being dropped.
+    #[tokio::test]
+    async fn next_matching_frame_hands_over_other_frames() {
+        let stray = measurement_frame();
+        let reply = payload::monitoring();
+        let chunks = vec![(C_RX, stray.clone()), (C_RX, reply.clone())];
+
+        let (found, others) = wait(chunks, FrameKind::Command).await;
+        assert_eq!(found, Some(reply));
+        assert_eq!(others, vec![stray]);
+    }
+
+    #[tokio::test]
+    async fn next_matching_frame_reassembles_across_notifications() {
+        let wanted = measurement_frame();
+        let (head, tail) = wanted.split_at(7);
+        let chunks = vec![(C_RX, head.to_vec()), (C_RX, tail.to_vec())];
+
+        let (found, _) = wait(chunks, FrameKind::Measurement).await;
+        assert_eq!(found, Some(wanted));
+    }
+
+    #[tokio::test]
+    async fn next_matching_frame_ignores_other_characteristics() {
+        let chunks = vec![(C_TX, measurement_frame())];
+        let (found, others) = wait(chunks, FrameKind::Measurement).await;
+        assert_eq!(found, None, "a frame on TX must not be read as RX data");
+        assert!(others.is_empty());
+    }
+
+    /// `None` distinguishes "the link dropped" from "a frame arrived"; the
+    /// callers use it to decide between reconnecting and failing.
+    #[tokio::test]
+    async fn next_matching_frame_reports_a_closed_stream() {
+        let (found, _) = wait(vec![], FrameKind::Command).await;
+        assert_eq!(found, None);
     }
 }
