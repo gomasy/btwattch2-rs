@@ -52,6 +52,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     let cfg = cli.load_config()?;
     let mode = cli.mode();
+    cli.validate_prefix(&mode)?;
 
     // Stay quiet in Mackerel mode unless --debug is given, so nothing but
     // metrics reaches mackerel-agent.

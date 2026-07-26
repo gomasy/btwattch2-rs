@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -6,7 +7,9 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeDelta, TimeZone};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_INDEX: usize = 0;
-pub const DEFAULT_INTERVAL: u64 = 1;
+/// One second. `NonZeroU64::MIN` *is* 1, and spelling it that way keeps the
+/// default free of a const `unwrap`.
+pub const DEFAULT_INTERVAL: NonZeroU64 = NonZeroU64::MIN;
 
 /// How measurements are rendered to stdout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -23,6 +26,31 @@ pub enum OutputFormat {
     Prometheus,
     /// Mackerel custom metrics (`name.metric<TAB>value<TAB>epoch`).
     Mackerel,
+}
+
+/// Characters a Prometheus metric name may contain. `parse_metric_name` accepts
+/// this set plus `.` and `-` for Mackerel's benefit, so keeping the narrow set
+/// in one predicate is what makes the subset relation between the two real
+/// rather than a claim in a doc comment.
+fn prometheus_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | ':')
+}
+
+impl OutputFormat {
+    /// Reject a metric prefix this format cannot express. Prometheus metric
+    /// names allow only `[A-Za-z_:][A-Za-z0-9_:]*`, so a name carrying a `.` or
+    /// `-` would emit an exposition no scraper will parse.
+    pub fn validate_prefix(self, prefix: &str) -> Result<()> {
+        if self == OutputFormat::Prometheus
+            && let Some(bad) = prefix.chars().find(|&c| !prometheus_char(c))
+        {
+            bail!(
+                "metric name {prefix:?} contains {bad:?}, which a Prometheus metric name \
+                 cannot; use letters, digits, `_`, or `:`"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Verbosity of informational messages on stderr.
@@ -47,9 +75,8 @@ pub struct ConnectOpts {
     pub addr: Option<BDAddr>,
 
     /// Specify the seconds to wait between updates [default: 1].
-    #[arg(short = 'n', long, value_name = "second(s)",
-          value_parser = clap::value_parser!(u64).range(1..))]
-    pub interval: Option<u64>,
+    #[arg(short = 'n', long, value_name = "second(s)")]
+    pub interval: Option<NonZeroU64>,
 }
 
 impl ConnectOpts {
@@ -68,7 +95,10 @@ impl ConnectOpts {
 pub struct ConnectionConfig {
     pub index: usize,
     pub addr: BDAddr,
-    pub interval: u64,
+    /// Non-zero by construction: it becomes a `tokio::time::interval` period,
+    /// which panics on a zero duration. Enforcing it in the type keeps that out
+    /// of reach instead of resting on the two parsers that feed this struct.
+    pub interval: NonZeroU64,
 }
 
 /// Toolkit for the RS-BTWATTCH2 Bluetooth power meter.
@@ -83,13 +113,13 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     /// Path to the agent's unix socket. Defaults to
-    /// $XDG_RUNTIME_DIR/btwattch2.sock (or /tmp/btwattch2.sock).
+    /// $XDG_RUNTIME_DIR/btwattch2.sock (or /run/btwattch2/btwattch2.sock).
     #[arg(long, value_name = "path")]
     pub socket: Option<PathBuf>,
 
     /// Path to the agent's pid file. Defaults to the socket path with a
     /// `.pid` extension, i.e. $XDG_RUNTIME_DIR/btwattch2.pid (or
-    /// /tmp/btwattch2.pid). Overrides the derived location.
+    /// /run/btwattch2/btwattch2.pid). Overrides the derived location.
     #[arg(long, value_name = "path")]
     pub pid_file: Option<PathBuf>,
 
@@ -114,7 +144,7 @@ pub struct Cli {
     pub test_led: bool,
 
     /// Print a measurement as Mackerel custom metrics and exit.
-    #[arg(long, value_name = "name", group = "mode")]
+    #[arg(long, value_name = "name", value_parser = parse_metric_name, group = "mode")]
     pub metric_name: Option<String>,
 
     /// Scan for nearby BTWATTCH2 devices and list them, then exit.
@@ -248,6 +278,12 @@ impl Cli {
         })
     }
 
+    /// Reject a metric prefix the chosen format cannot represent, before
+    /// anything connects to the device.
+    pub fn validate_prefix(&self, mode: &Mode) -> Result<()> {
+        self.output_format().validate_prefix(mode.prefix())
+    }
+
     /// Effective log level, applying the precedence
     /// --log-level > --quiet > --debug > mode default.
     pub fn log_level(&self, is_metric: bool) -> LogLevel {
@@ -314,7 +350,7 @@ impl Cli {
                 bail!("{}: expected `key = value`, got: {line}", place());
             };
             let key = key.trim();
-            let value = value.trim().trim_matches('"');
+            let value = unquote(value.trim());
             match key {
                 "index" => {
                     cfg.index = Some(
@@ -323,14 +359,12 @@ impl Cli {
                             .with_context(|| format!("{}: invalid index: {value}", place()))?,
                     )
                 }
+                // `NonZeroU64` rejects 0 as a parse error, so there is no
+                // separate range check to keep in step with clap's.
                 "interval" => {
-                    let interval: u64 = value
-                        .parse()
-                        .with_context(|| format!("{}: invalid interval: {value}", place()))?;
-                    if interval == 0 {
-                        bail!("{}: interval must be at least 1", place());
-                    }
-                    cfg.interval = Some(interval);
+                    cfg.interval = Some(value.parse().with_context(|| {
+                        format!("{}: invalid interval (must be 1 or more): {value}", place())
+                    })?)
                 }
                 "addr" => {
                     cfg.addr = Some(
@@ -358,6 +392,39 @@ impl Cli {
         }
         paths
     }
+}
+
+/// Strip one matching pair of double quotes, so `addr = "..."` and `addr = ...`
+/// both work. `trim_matches` would peel off every quote at both ends, quietly
+/// accepting `""""` and the like; leaving the extras in makes the value fail to
+/// parse with an error naming the line, which is the point of this parser.
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+/// Accept only metric names every supported backend can carry. Beyond the
+/// obviously broken, this keeps a name containing a newline or a tab from
+/// forging extra metric lines in the line-oriented formats.
+/// The union of what every supported backend accepts: `prometheus_char` plus
+/// `.` and `-` for Mackerel. `OutputFormat::validate_prefix` narrows it again
+/// per format. Rejecting the rest also keeps a name containing a newline or a
+/// tab from forging extra metric lines in the line-oriented formats.
+fn parse_metric_name(s: &str) -> Result<String> {
+    let mut chars = s.chars();
+    let head = chars
+        .next()
+        .is_some_and(|c| prometheus_char(c) && !c.is_ascii_digit());
+    let tail = chars.all(|c| prometheus_char(c) || matches!(c, '.' | '-'));
+    if !head || !tail {
+        bail!(
+            "invalid metric name {s:?}: use a letter, `_`, or `:`, followed by letters, \
+             digits, `_`, `:`, `.`, or `-`"
+        );
+    }
+    Ok(s.to_string())
 }
 
 /// $XDG_CONFIG_HOME/btwattch2/config.toml, falling back to
@@ -399,4 +466,160 @@ fn parse_time(s: &str) -> Result<DateTime<Local>> {
         .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
         .and_then(local_datetime)
         .ok_or_else(|| anyhow!("unrecognized time format: {s}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("btwattch2").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn unquote_strips_one_pair_only() {
+        assert_eq!(unquote("\"abc\""), "abc");
+        assert_eq!(unquote("abc"), "abc");
+        // Leftover quotes are kept so the value fails to parse with a message
+        // naming the line, rather than being silently accepted.
+        assert_eq!(unquote("\"\"abc\"\""), "\"abc\"");
+        assert_eq!(unquote("\"abc"), "\"abc");
+    }
+
+    #[test]
+    fn metric_name_accepts_backend_safe_names() {
+        // `:` is legal in a Prometheus metric name, so it must survive here too.
+        for name in ["wattchecker1", "_x", "a.b-c_1", "job:power", ":x"] {
+            assert_eq!(parse_metric_name(name).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn metric_name_rejects_injection_and_bad_leading_chars() {
+        // A newline would forge extra lines in every line-oriented format.
+        for name in ["", "1abc", "a b", "a\nb.wattage\t0\t0", "a\tb", ".x"] {
+            assert!(parse_metric_name(name).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn prometheus_rejects_a_prefix_it_cannot_express() {
+        let cli = parse_cli(&["--format", "prometheus", "--metric-name", "a.b"]);
+        assert!(cli.validate_prefix(&cli.mode()).is_err());
+    }
+
+    #[test]
+    fn prometheus_accepts_underscored_prefixes_and_the_default() {
+        for args in [
+            vec!["--format", "prometheus", "--metric-name", "a_b1"],
+            vec!["--format", "prometheus"],
+        ] {
+            let cli = parse_cli(&args);
+            assert!(cli.validate_prefix(&cli.mode()).is_ok());
+        }
+    }
+
+    /// A dotted name is fine for Mackerel, so only Prometheus may reject it.
+    #[test]
+    fn other_formats_accept_a_dotted_prefix() {
+        let cli = parse_cli(&["--metric-name", "a.b"]);
+        assert!(cli.validate_prefix(&cli.mode()).is_ok());
+    }
+
+    #[test]
+    fn cli_overlays_the_config_file() {
+        let cfg = ConnectOpts {
+            index: Some(1),
+            addr: Some("CB:DF:6B:12:34:56".parse().unwrap()),
+            interval: NonZeroU64::new(9),
+        };
+        let resolved = parse_cli(&["-n", "3"])
+            .connection_config(Some(&cfg))
+            .unwrap();
+        assert_eq!(resolved.interval.get(), 3);
+        assert_eq!(resolved.index, 1);
+        assert_eq!(resolved.addr, cfg.addr.unwrap());
+    }
+
+    #[test]
+    fn connection_config_needs_an_address() {
+        assert!(parse_cli(&[]).connection_config(None).is_err());
+    }
+
+    #[test]
+    fn metric_mode_takes_one_sample_unless_told_otherwise() {
+        let cli = parse_cli(&["--metric-name", "x"]);
+        assert_eq!(cli.sample_count(&cli.mode()), Some(1));
+
+        let cli = parse_cli(&["--metric-name", "x", "--duration", "10"]);
+        assert_eq!(cli.sample_count(&cli.mode()), None);
+
+        // Monitor mode streams until stopped.
+        let cli = parse_cli(&[]);
+        assert_eq!(cli.sample_count(&cli.mode()), None);
+    }
+
+    #[test]
+    fn log_level_precedence() {
+        assert_eq!(parse_cli(&[]).log_level(false), LogLevel::Info);
+        // Metric mode stays quiet so only metrics reach mackerel-agent.
+        assert_eq!(parse_cli(&[]).log_level(true), LogLevel::Off);
+        assert_eq!(parse_cli(&["-d"]).log_level(true), LogLevel::Info);
+        assert_eq!(parse_cli(&["-q"]).log_level(false), LogLevel::Off);
+        // --quiet beats --debug, and --log-level beats both.
+        assert_eq!(parse_cli(&["-d", "-q"]).log_level(false), LogLevel::Off);
+        assert_eq!(
+            parse_cli(&["-q", "--log-level", "info"]).log_level(true),
+            LogLevel::Info
+        );
+    }
+
+    #[test]
+    fn output_format_defaults_to_mackerel_only_for_metric_mode() {
+        assert_eq!(parse_cli(&[]).output_format(), OutputFormat::Plain);
+        assert_eq!(
+            parse_cli(&["--metric-name", "x"]).output_format(),
+            OutputFormat::Mackerel
+        );
+        assert_eq!(
+            parse_cli(&["--metric-name", "x", "--format", "json"]).output_format(),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn parse_time_accepts_every_documented_format() {
+        let expected = local_datetime(
+            NaiveDateTime::parse_from_str("2021-01-02 03:04:05", "%Y-%m-%d %H:%M:%S").unwrap(),
+        )
+        .unwrap();
+        for s in [
+            "2021-01-02 03:04:05",
+            "2021-01-02T03:04:05",
+            "2021/01/02 03:04:05",
+        ] {
+            assert_eq!(parse_time(s).unwrap(), expected, "parsing {s}");
+        }
+        assert!(parse_time("yesterday").is_err());
+    }
+
+    /// Drives the SIGPIPE choice, so only the long-running daemon may say yes:
+    /// a CLI wants a closed pipe to be fatal, the agent must survive one.
+    #[test]
+    fn only_agent_start_is_the_daemon() {
+        assert!(parse_cli(&["agent", "start"]).is_agent_start());
+        for args in [
+            vec!["agent", "stop"],
+            vec!["agent", "status"],
+            vec!["--scan"],
+            vec![],
+        ] {
+            assert!(!parse_cli(&args).is_agent_start(), "claimed {args:?}");
+        }
+    }
+
+    #[test]
+    fn interval_must_be_at_least_one() {
+        assert!(Cli::try_parse_from(["btwattch2", "-n", "0"]).is_err());
+    }
 }

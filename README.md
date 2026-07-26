@@ -177,7 +177,7 @@ Every command normally connects and disconnects BLE, which takes several seconds
 # btwattch2 agent stop
 ```
 
-The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock` (or `/tmp/btwattch2.sock` when `XDG_RUNTIME_DIR` is unset). Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
+The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
 
 ```console
 # btwattch2 --socket /run/btwattch2/device-a.sock --addr CB:DF:6B:12:34:56 agent start
