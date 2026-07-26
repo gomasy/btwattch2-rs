@@ -125,11 +125,10 @@ impl FrameAssembler {
                 self.buf.drain(..header);
             }
 
-            if self.buf.len() < 3 {
-                return None;
-            }
+            // The header is in place but the size field may not have arrived.
+            let &[_, hi, lo] = self.buf.first_chunk::<3>()?;
 
-            let payload_len = u16::from_be_bytes([self.buf[1], self.buf[2]]) as usize;
+            let payload_len = u16::from_be_bytes([hi, lo]) as usize;
             let frame_len = payload_len + FRAME_OVERHEAD;
             if frame_len > MAX_FRAME_LEN {
                 eprintln!("[WARN] Discarding oversized frame, resynchronizing");
@@ -539,21 +538,24 @@ impl Connection {
 }
 
 pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
-    if frame.len() < MEASUREMENT_FRAME_MIN_LEN {
-        bail!("frame too short: {} bytes", frame.len());
-    }
+    // Take the fields off a fixed-size array rather than the slice, so the
+    // length check below and the offsets that follow cannot drift apart: every
+    // index is checked against the array's own type.
+    let body: &[u8; MEASUREMENT_FRAME_MIN_LEN] = frame
+        .first_chunk()
+        .ok_or_else(|| anyhow!("frame too short: {} bytes", frame.len()))?;
 
     // [sec, min, hour, day, mon, year - 1900]
-    let date = &frame[23..29];
+    let date = &body[23..29];
     let timestamp =
         NaiveDate::from_ymd_opt(1900 + date[5] as i32, date[4] as u32 + 1, date[3] as u32)
             .and_then(|d| d.and_hms_opt(date[2] as u32, date[1] as u32, date[0] as u32))
             .and_then(local_datetime)
             .ok_or_else(|| anyhow!("invalid timestamp in frame"))?;
 
-    let voltage = u48_le(&frame[5..11]) as f64 / VOLTAGE_SCALE;
-    let ampere = u48_le(&frame[11..17]) as f64 / AMPERE_SCALE;
-    let wattage = u48_le(&frame[17..23]) as f64 / WATTAGE_SCALE;
+    let voltage = u48_le(&body[5..11]) as f64 / VOLTAGE_SCALE;
+    let ampere = u48_le(&body[11..17]) as f64 / AMPERE_SCALE;
+    let wattage = u48_le(&body[17..23]) as f64 / WATTAGE_SCALE;
     let power_factor = if voltage > 0.0 && ampere > 0.0 {
         wattage / (voltage * ampere)
     } else {
@@ -582,9 +584,13 @@ pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
     }
 }
 
+/// Little-endian u48. Reads at most 6 bytes and zero-pads a shorter slice, so
+/// the only caller's offsets cannot turn into a panic if they ever slip.
 fn u48_le(payload: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
-    bytes[..6].copy_from_slice(&payload[..6]);
+    for (dst, src) in bytes.iter_mut().zip(payload.iter().take(6)) {
+        *dst = *src;
+    }
     u64::from_le_bytes(bytes)
 }
 
