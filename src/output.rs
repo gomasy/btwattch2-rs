@@ -1,6 +1,8 @@
 use std::ops::ControlFlow;
 use std::time::Instant;
 
+use serde::ser::{Serialize, SerializeMap, Serializer};
+
 use crate::cli::{LogLevel, OutputFormat};
 use crate::connection::Measurement;
 
@@ -19,11 +21,55 @@ const CHANNELS: [ChannelSpec; 4] = [
         |m| m.power_factor,
     ),
 ];
+const ENERGY_NAME: &str = "energy_wh";
 const ENERGY_HELP: &str = "Energy accumulated this session in watt-hours";
+
+/// The fields of a record, in output order: the channels, then session energy.
+/// Every format that carries energy composes its record from this, so a channel
+/// added or renamed shows up everywhere at once instead of in one arm.
+fn fields(m: &Measurement, energy_wh: f64) -> impl Iterator<Item = (&'static str, f64)> {
+    CHANNELS
+        .iter()
+        .map(move |(name, _, value)| (*name, value(m)))
+        .chain([(ENERGY_NAME, energy_wh)])
+}
+
+/// The same names without needing a measurement, for headers.
+fn field_names() -> impl Iterator<Item = &'static str> {
+    CHANNELS
+        .iter()
+        .map(|(name, _, _)| *name)
+        .chain([ENERGY_NAME])
+}
+
+/// One JSON Lines record. Serialized through serde, which gets the escaping and
+/// the `null` for a non-finite float that a formatted string would not, but
+/// written entry by entry: a `Value` or `json!` map sorts keys alphabetically
+/// and would reorder the documented column layout, and a `#[derive]`d struct
+/// would re-list the channels that `CHANNELS` already owns.
+struct JsonLine<'a> {
+    measurement: &'a Measurement,
+    energy_wh: f64,
+}
+
+impl Serialize for JsonLine<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(CHANNELS.len() + 2))?;
+        map.serialize_entry("time", &self.measurement.timestamp.timestamp())?;
+        for (name, value) in fields(self.measurement, self.energy_wh) {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
 
 /// Renders measurements to stdout in the requested format. Formats that need
 /// a header (CSV) or a metric declaration block (Prometheus) print it once,
 /// before the first measurement.
+///
+/// Machine-readable formats emit every value at full precision, `energy_wh`
+/// included, and leave rounding to whatever consumes them. Only `plain` and the
+/// end-of-run summary round, because those are read by people.
 pub struct Printer {
     format: OutputFormat,
     prefix: String,
@@ -56,41 +102,33 @@ impl Printer {
             }
             OutputFormat::Csv => {
                 if !self.header_printed {
-                    let names: Vec<&str> = CHANNELS.iter().map(|(n, _, _)| *n).collect();
-                    println!("time,{},energy_wh", names.join(","));
+                    let names: Vec<&str> = field_names().collect();
+                    println!("time,{}", names.join(","));
                     self.header_printed = true;
                 }
-                let values: Vec<String> = CHANNELS
-                    .iter()
-                    .map(|(_, _, value)| value(m).to_string())
+                let values: Vec<String> = fields(m, energy_wh)
+                    .map(|(_, value)| value.to_string())
                     .collect();
-                println!(
-                    "{},{},{energy_wh:.3}",
-                    m.timestamp.timestamp(),
-                    values.join(",")
-                );
+                println!("{},{}", m.timestamp.timestamp(), values.join(","));
             }
             OutputFormat::Ltsv => {
-                let fields: Vec<String> = CHANNELS
-                    .iter()
-                    .map(|(name, _, value)| format!("{name}:{}", value(m)))
+                let labelled: Vec<String> = fields(m, energy_wh)
+                    .map(|(name, value)| format!("{name}:{value}"))
                     .collect();
-                println!(
-                    "time:{}\t{}\tenergy_wh:{energy_wh:.3}",
-                    m.timestamp.timestamp(),
-                    fields.join("\t")
-                );
+                println!("time:{}\t{}", m.timestamp.timestamp(), labelled.join("\t"));
             }
             OutputFormat::Json => {
-                let fields: Vec<String> = CHANNELS
-                    .iter()
-                    .map(|(name, _, value)| format!("\"{name}\":{}", value(m)))
-                    .collect();
-                println!(
-                    "{{\"time\":{},{},\"energy_wh\":{energy_wh:.3}}}",
-                    m.timestamp.timestamp(),
-                    fields.join(",")
-                );
+                let line = JsonLine {
+                    measurement: m,
+                    energy_wh,
+                };
+                match serde_json::to_string(&line) {
+                    Ok(json) => println!("{json}"),
+                    // Nothing in `JsonLine` can fail to serialize, but skipping
+                    // one sample beats taking the whole run down if that ever
+                    // stops being true.
+                    Err(e) => eprintln!("[ERR] Failed to encode measurement: {e}"),
+                }
             }
             OutputFormat::Prometheus => {
                 let epoch_ms = m.timestamp.timestamp_millis();
@@ -98,17 +136,16 @@ impl Printer {
                     for (suffix, help) in CHANNELS
                         .iter()
                         .map(|(n, h, _)| (*n, *h))
-                        .chain([("energy_wh", ENERGY_HELP)])
+                        .chain([(ENERGY_NAME, ENERGY_HELP)])
                     {
                         println!("# HELP {}_{suffix} {help}", self.prefix);
                         println!("# TYPE {}_{suffix} gauge", self.prefix);
                     }
                     self.header_printed = true;
                 }
-                for (suffix, _, value) in CHANNELS {
-                    println!("{}_{suffix} {} {epoch_ms}", self.prefix, value(m));
+                for (suffix, value) in fields(m, energy_wh) {
+                    println!("{}_{suffix} {value} {epoch_ms}", self.prefix);
                 }
-                println!("{}_energy_wh {energy_wh} {epoch_ms}", self.prefix);
             }
         }
     }
@@ -253,7 +290,10 @@ impl Default for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Local;
+    use chrono::{Local, TimeZone};
+
+    /// A fixed timestamp, so a rendered line can be asserted whole.
+    const EPOCH: i64 = 1609304963;
 
     fn measurement(wattage: f64) -> Measurement {
         Measurement {
@@ -261,8 +301,50 @@ mod tests {
             ampere: 1.0,
             wattage,
             power_factor: 1.0,
-            timestamp: Local::now(),
+            timestamp: Local
+                .timestamp_opt(EPOCH, 0)
+                .single()
+                .expect("fixed epoch is unambiguous in every timezone"),
         }
+    }
+
+    fn json_line(m: &Measurement, energy_wh: f64) -> String {
+        serde_json::to_string(&JsonLine {
+            measurement: m,
+            energy_wh,
+        })
+        .unwrap()
+    }
+
+    /// The documented column order, which a `serde_json::Map` would resort.
+    #[test]
+    fn json_keys_stay_in_channel_order() {
+        let json = json_line(&measurement(2.0), 0.5);
+        let keys: Vec<&str> = json
+            .split(',')
+            .filter_map(|f| f.split(':').next())
+            .map(|k| k.trim_matches(['{', '"']))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "time",
+                "voltage",
+                "ampere",
+                "wattage",
+                "power_factor",
+                "energy_wh"
+            ]
+        );
+    }
+
+    /// JSON has no NaN token; going through serde turns one into `null` rather
+    /// than emitting a line no parser accepts.
+    #[test]
+    fn json_encodes_a_non_finite_value_as_null() {
+        let json = json_line(&measurement(f64::NAN), f64::INFINITY);
+        assert!(json.contains("\"wattage\":null"), "{json}");
+        assert!(json.contains("\"energy_wh\":null"), "{json}");
     }
 
     #[test]

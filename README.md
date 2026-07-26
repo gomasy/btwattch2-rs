@@ -71,13 +71,15 @@ V = 104.19976472854614, A = 1.1281732693314552, W = 105.39636832475662, PF = 0.8
 ...
 ```
 
-`PF` is the power factor, derived as `wattage / (voltage * ampere)`. `Wh` is the energy accumulated during this run, integrated from the wattage and the interval.
+`PF` is the power factor, derived as `wattage / (voltage * ampere)`. `Wh` is the energy accumulated during this run, integrated over the wall-clock time actually elapsed between samples — so the first sample contributes nothing, and a reconnect gap is accounted for at its real length rather than at the nominal interval.
 
 On exit (Ctrl-C, `--count`, or `--duration`) a summary of min/max/avg per channel and the total energy is printed to stderr.
 
 ### Output formats (`--format`)
 
 Measurements can be rendered in several machine-friendly formats for piping into other tools. An explicit `--format` always wins; otherwise `--metric-name` defaults to `mackerel` and everything else to `plain`.
+
+Every format but `plain` emits values at full precision and leaves rounding to whatever consumes them. Only `plain` and the end-of-run summary round, since those are read by people. (The examples below are shortened for readability.)
 
 - `plain` — the human-readable line above (default).
 - `json` — one JSON object per line (JSON Lines):
