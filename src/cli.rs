@@ -197,6 +197,17 @@ impl Mode {
 }
 
 impl Cli {
+    /// Whether this invocation is the long-running daemon, which needs the
+    /// opposite SIGPIPE disposition from every short-lived CLI command.
+    pub fn is_agent_start(&self) -> bool {
+        matches!(
+            self.command,
+            Some(Command::Agent {
+                action: AgentAction::Start
+            })
+        )
+    }
+
     pub fn mode(&self) -> Mode {
         if self.get_rtc {
             Mode::GetRtc

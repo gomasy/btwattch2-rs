@@ -3,6 +3,7 @@ mod cli;
 mod connection;
 mod output;
 mod payload;
+mod signal;
 
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -16,12 +17,28 @@ use agent::protocol::{Request, Response};
 use cli::{AgentAction, Cli, Command, LogLevel, Mode};
 use connection::{Connection, Measurement, ScannedDevice, info};
 use output::StreamRenderer;
+use signal::Sigpipe;
 
 const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Parse the command line, then hand off to the runtime. Kept synchronous so
+/// the SIGPIPE decision lands before any thread is spawned, which is what makes
+/// `set_sigpipe` safe to call at all.
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    signal::set_sigpipe(if cli.is_agent_start() {
+        Sigpipe::Ignored
+    } else {
+        Sigpipe::Fatal
+    });
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     let paths = cli.agent_paths();
 
     if let Some(Command::Agent { action }) = &cli.command {
