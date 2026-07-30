@@ -622,6 +622,32 @@ pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
     }
 }
 
+/// The measurement fixture every module's tests build on, kept beside the type
+/// itself so a new channel is added in one place rather than in each suite.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+
+    /// A fixed timestamp, so a rendered line can be asserted whole. Unambiguous
+    /// in every timezone.
+    pub const EPOCH: i64 = 1609304963;
+
+    /// A measurement with round numbers, so a formatted value reads as written.
+    pub fn measurement(wattage: f64) -> Measurement {
+        use chrono::TimeZone;
+        Measurement {
+            voltage: 100.0,
+            ampere: 1.0,
+            wattage,
+            power_factor: 1.0,
+            timestamp: Local
+                .timestamp_opt(EPOCH, 0)
+                .single()
+                .expect("the fixed epoch is unambiguous in every timezone"),
+        }
+    }
+}
+
 /// Little-endian u48. Reads at most 6 bytes and zero-pads a shorter slice, so
 /// the only caller's offsets cannot turn into a panic if they ever slip.
 fn u48_le(payload: &[u8]) -> u64 {

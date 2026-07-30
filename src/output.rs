@@ -290,23 +290,7 @@ impl Default for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Local, TimeZone};
-
-    /// A fixed timestamp, so a rendered line can be asserted whole.
-    const EPOCH: i64 = 1609304963;
-
-    fn measurement(wattage: f64) -> Measurement {
-        Measurement {
-            voltage: 100.0,
-            ampere: 1.0,
-            wattage,
-            power_factor: 1.0,
-            timestamp: Local
-                .timestamp_opt(EPOCH, 0)
-                .single()
-                .expect("fixed epoch is unambiguous in every timezone"),
-        }
-    }
+    use crate::connection::testutil::measurement;
 
     fn json_line(m: &Measurement, energy_wh: f64) -> String {
         serde_json::to_string(&JsonLine {
