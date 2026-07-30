@@ -206,9 +206,10 @@ impl Connection {
     /// address before a first connection.
     ///
     /// BlueZ hands back every device it has ever seen, not just the ones in
-    /// range, so results are limited to those advertising an RSSI — the
-    /// property it drops once a device stops being discovered. Without that, a
-    /// scan lists neighbours that moved out months ago.
+    /// range, so results are limited to those that advertised an RSSI at some
+    /// point during the window — the property it drops once a device stops being
+    /// discovered. Without that, a scan lists neighbours that moved out months
+    /// ago.
     pub async fn scan(index: usize, duration: Duration) -> Result<Vec<ScannedDevice>> {
         let manager = Manager::new().await?;
         let name = format!("hci{index}");
@@ -238,7 +239,17 @@ impl Connection {
                 let Some(props) = dev.properties().await? else {
                     continue;
                 };
-                found.insert(addr, (props.local_name, props.rssi));
+                // Merged rather than overwritten: BlueZ drops the RSSI again once
+                // a device stops being discovered, and overwriting would take a
+                // device that advertised early in a long window back out of the
+                // results — the very thing the RSSI is being used to prove.
+                let (name, rssi) = found.entry(addr).or_default();
+                if props.local_name.is_some() {
+                    *name = props.local_name;
+                }
+                if props.rssi.is_some() {
+                    *rssi = props.rssi;
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
