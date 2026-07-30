@@ -33,6 +33,7 @@ Options:
   -n, --interval <interval> Specify the time to wait between updates,
                              e.g. 2s or 500ms [default: 1s]
   -c, --config <path>       Path to a config file (TOML-like `key = value`)
+  --device <name>           Use the named [devices.<name>] section of the config file
   --on                      Turn on the power switch
   --off                     Turn off the power switch
   --set-rtc <time>          Specify the time to set to RTC
@@ -198,7 +199,7 @@ The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` i
 # btwattch2 --socket /run/btwattch2/device-a.sock --on
 ```
 
-The pid file is derived from the socket path by extension (`btwattch2.sock` → `btwattch2.pid`) by default, so usually you only set the socket. Override it independently with `--pid-file <path>` if you need the pid elsewhere. Run multiple agents on separate sockets (and pid files) to manage several devices at once.
+The pid file is derived from the socket path by extension (`btwattch2.sock` → `btwattch2.pid`) by default, so usually you only set the socket. Override it independently with `--pid-file <path>` if you need the pid elsewhere. Run multiple agents on separate sockets (and pid files) to manage several devices at once — the config file can hold each one's socket, so `--device` alone routes to the right agent (see "Configuration file" below).
 
 When the agent is running, CLI commands detect it and route through the socket. When it is not running, they fall back to direct BLE as before — no flags needed.
 
@@ -233,6 +234,33 @@ addr = "CB:DF:6B:12:34:56"
 index = 0
 interval = 1s
 ```
+
+Recognised keys are `addr`, `index`, `interval`, and `socket`. Unknown keys, malformed lines, and invalid values are errors rather than silently ignored, so a typo cannot leave you talking to the wrong device.
+
+#### Device profiles
+
+With more than one meter, give each a `[devices.<name>]` section and select it with `--device <name>`. Keys before the first section are defaults every profile inherits, and `default` picks the profile to use when `--device` is absent:
+
+```toml
+# ~/.config/btwattch2/config.toml
+interval = 1s
+default = "living"
+
+[devices.living]
+addr = "CB:DF:6B:12:34:56"
+
+[devices.rack]
+addr = "CB:DF:6B:AA:BB:CC"
+interval = 500ms
+socket = "/run/btwattch2/rack.sock"
+```
+
+```console
+# btwattch2 --off                     # the default profile: living
+# btwattch2 --device rack --off       # the rack meter, via its own socket
+```
+
+Because `socket` travels with the profile, `--device rack` reaches the agent holding that meter without repeating `--socket` on every command. A `--device` naming no section is an error listing the ones that exist.
 
 ### Verbosity
 

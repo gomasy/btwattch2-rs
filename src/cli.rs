@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -121,9 +122,8 @@ pub enum LogLevel {
     Info,
 }
 
-/// Options needed to reach the device, whatever the mode. Also the shape of
-/// the config file: `load_config` parses into this and `or` overlays the CLI.
-#[derive(Args, Debug, Default)]
+/// Options needed to reach the device, whatever the mode.
+#[derive(Args, Clone, Debug, Default)]
 pub struct ConnectOpts {
     /// Specify adapter index, e.g. hci0 [default: 0].
     #[arg(short, long, value_name = "index")]
@@ -140,11 +140,36 @@ pub struct ConnectOpts {
 
 impl ConnectOpts {
     /// Overlay `self` on `fallback`: any field set here wins.
-    fn or(&self, fallback: Option<&ConnectOpts>) -> ConnectOpts {
+    fn or(&self, fallback: &ConnectOpts) -> ConnectOpts {
         ConnectOpts {
-            index: self.index.or_else(|| fallback.and_then(|c| c.index)),
-            addr: self.addr.or_else(|| fallback.and_then(|c| c.addr)),
-            interval: self.interval.or_else(|| fallback.and_then(|c| c.interval)),
+            index: self.index.or(fallback.index),
+            addr: self.addr.or(fallback.addr),
+            interval: self.interval.or(fallback.interval),
+        }
+    }
+}
+
+/// Everything one device needs: how to reach it, and where the agent holding it
+/// keeps its socket.
+///
+/// One type for three roles, because they have the same shape and the same
+/// merge rule: a `[devices.*]` section, the config file's own top-level keys,
+/// and what an invocation finally runs with once the command line has been
+/// overlaid on both.
+#[derive(Clone, Debug, Default)]
+pub struct Settings {
+    pub connect: ConnectOpts,
+    pub socket: Option<PathBuf>,
+}
+
+impl Settings {
+    /// Overlay `self` on `fallback`: any field set here wins. Used twice, with
+    /// the same meaning both times — a `[devices.*]` section over the file's
+    /// top-level keys, then the command line over the result.
+    fn or(&self, fallback: &Settings) -> Settings {
+        Settings {
+            connect: self.connect.or(&fallback.connect),
+            socket: self.socket.clone().or_else(|| fallback.socket.clone()),
         }
     }
 }
@@ -160,6 +185,43 @@ pub struct ConnectionConfig {
     pub interval: Interval,
 }
 
+/// The config file: keys given outside any section, the `[devices.NAME]`
+/// sections, and which of them `--device` defaults to.
+#[derive(Debug, Default)]
+pub struct FileConfig {
+    defaults: Settings,
+    devices: BTreeMap<String, Settings>,
+    default_device: Option<String>,
+    path: PathBuf,
+}
+
+impl FileConfig {
+    /// The profile to use, inheriting the file's top-level keys. `name` is
+    /// `--device`; without it the file's `default` applies, and without that
+    /// the top-level keys are the whole configuration.
+    fn profile(&self, name: Option<&str>) -> Result<Settings> {
+        let Some(name) = name.or(self.default_device.as_deref()) else {
+            return Ok(self.defaults.clone());
+        };
+        let device = self.devices.get(name).ok_or_else(|| {
+            let known = self.device_names();
+            anyhow!(
+                "unknown device {name:?} in {}; {known}",
+                self.path.display()
+            )
+        })?;
+        Ok(device.or(&self.defaults))
+    }
+
+    fn device_names(&self) -> String {
+        if self.devices.is_empty() {
+            return "the file defines no [devices.*] sections".to_string();
+        }
+        let names: Vec<&str> = self.devices.keys().map(String::as_str).collect();
+        format!("known devices: {}", names.join(", "))
+    }
+}
+
 /// Toolkit for the RS-BTWATTCH2 Bluetooth power meter.
 #[derive(Parser, Debug)]
 pub struct Cli {
@@ -170,6 +232,10 @@ pub struct Cli {
     /// $XDG_CONFIG_HOME/btwattch2/config.toml or ~/.config/btwattch2/config.toml.
     #[arg(short = 'c', long, value_name = "path")]
     pub config: Option<PathBuf>,
+
+    /// Use the named `[devices.<name>]` section of the config file.
+    #[arg(long, value_name = "name")]
+    pub device: Option<String>,
 
     /// Path to the agent's unix socket. Defaults to
     /// $XDG_RUNTIME_DIR/btwattch2.sock (or /run/btwattch2/btwattch2.sock).
@@ -391,20 +457,41 @@ impl Cli {
         }
     }
 
-    /// Adapter index to use, merging the config file under the CLI. Shared by
-    /// the scan path (which needs no address) and `connection_config`.
-    pub fn adapter_index(&self, cfg: Option<&ConnectOpts>) -> usize {
-        self.connect.or(cfg).index.unwrap_or(DEFAULT_INDEX)
+    /// Resolve everything the invocation needs from the command line and the
+    /// config file, the command line winning. Done once per run so the config
+    /// file is read and validated a single time.
+    pub fn settings(&self) -> Result<Settings> {
+        let file = self.load_config()?;
+        let profile = match (&file, &self.device) {
+            (Some(file), device) => file.profile(device.as_deref())?,
+            (None, None) => Settings::default(),
+            // Naming a profile that cannot exist is a typo worth reporting:
+            // falling back to the defaults would connect to some other device.
+            (None, Some(device)) => bail!(
+                "--device {device} needs a config file defining [devices.{device}], and none was found"
+            ),
+        };
+
+        let cli = Settings {
+            connect: self.connect.clone(),
+            socket: self.socket.clone(),
+        };
+        Ok(cli.or(&profile))
     }
 
-    /// Resolve the device address and other connection parameters, merging the
-    /// config file (if any) under the CLI. Fails when no address is available.
-    pub fn connection_config(&self, cfg: Option<&ConnectOpts>) -> Result<ConnectionConfig> {
-        let merged = self.connect.or(cfg);
+    /// Adapter index to use. Shared by the scan path (which needs no address)
+    /// and `connection_config`.
+    pub fn adapter_index(&self, settings: &Settings) -> usize {
+        settings.connect.index.unwrap_or(DEFAULT_INDEX)
+    }
+
+    /// Resolve the device address and other connection parameters. Fails when
+    /// no address is available.
+    pub fn connection_config(&self, settings: &Settings) -> Result<ConnectionConfig> {
         Ok(ConnectionConfig {
-            index: merged.index.unwrap_or(DEFAULT_INDEX),
-            interval: merged.interval.unwrap_or(DEFAULT_INTERVAL),
-            addr: merged.addr.ok_or_else(|| {
+            index: self.adapter_index(settings),
+            interval: settings.connect.interval.unwrap_or(DEFAULT_INTERVAL),
+            addr: settings.connect.addr.ok_or_else(|| {
                 anyhow!("no device address given; pass --addr or set it in the config file")
             })?,
         })
@@ -413,7 +500,7 @@ impl Cli {
     /// Load a config file if one is requested or present at the default path.
     /// Malformed lines, unknown keys, and invalid values are hard errors so a
     /// typo can't silently fall back to defaults.
-    pub fn load_config(&self) -> Result<Option<ConnectOpts>> {
+    pub fn load_config(&self) -> Result<Option<FileConfig>> {
         let path = match &self.config {
             Some(p) => {
                 if !p.exists() {
@@ -430,54 +517,14 @@ impl Cli {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
 
-        let mut cfg = ConnectOpts::default();
-        for (lineno, raw) in text.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let place = || format!("{}:{}", path.display(), lineno + 1);
-            let Some((key, value)) = line.split_once('=') else {
-                bail!("{}: expected `key = value`, got: {line}", place());
-            };
-            let key = key.trim();
-            let value = unquote(value.trim());
-            match key {
-                "index" => {
-                    cfg.index = Some(
-                        value
-                            .parse()
-                            .with_context(|| format!("{}: invalid index: {value}", place()))?,
-                    )
-                }
-                // `Interval` rejects zero and anything below its floor as a
-                // parse error, so there is no separate range check to keep in
-                // step with clap's.
-                "interval" => {
-                    cfg.interval = Some(
-                        value
-                            .parse()
-                            .with_context(|| format!("{}: invalid interval", place()))?,
-                    )
-                }
-                "addr" => {
-                    cfg.addr = Some(
-                        value
-                            .parse()
-                            .map_err(|e| anyhow!("{}: invalid addr {value}: {e}", place()))?,
-                    )
-                }
-                _ => bail!("{}: unknown key: {key}", place()),
-            }
-        }
-        Ok(Some(cfg))
+        parse_config(&text, path).map(Some)
     }
 
-    /// Resolve the agent socket/pid paths, honouring `--socket` and
-    /// `--pid-file` if given. The pid file defaults to the socket path with a
-    /// `.pid` extension, which `--pid-file` overrides.
-    pub fn agent_paths(&self) -> crate::agent::AgentPaths {
-        let mut paths = match &self.socket {
+    /// Resolve the agent socket/pid paths, honouring `--socket` (or the selected
+    /// profile's) and `--pid-file` if given. The pid file defaults to the socket
+    /// path with a `.pid` extension, which `--pid-file` overrides.
+    pub fn agent_paths(&self, settings: &Settings) -> crate::agent::AgentPaths {
+        let mut paths = match &settings.socket {
             Some(s) => crate::agent::paths_from_socket(s.clone()),
             None => crate::agent::default_paths(),
         };
@@ -486,6 +533,124 @@ impl Cli {
         }
         paths
     }
+}
+
+/// Parse a config file: `key = value` lines, optionally grouped into
+/// `[devices.NAME]` sections. Keys before the first section are defaults every
+/// section inherits, which is also the whole configuration for a file with no
+/// sections at all — the only shape that existed before profiles.
+fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
+    let mut config = FileConfig {
+        path,
+        ..FileConfig::default()
+    };
+    // Which profile the keys currently being read belong to. Held by name
+    // rather than as a borrow so the map stays writable underneath.
+    let mut section: Option<String> = None;
+
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let place = || format!("{}:{}", config.path.display(), lineno + 1);
+
+        if let Some(header) = line.strip_prefix('[') {
+            let name = header
+                .strip_suffix(']')
+                .ok_or_else(|| anyhow!("{}: unterminated section header: {line}", place()))?
+                .trim();
+            let device = name.strip_prefix("devices.").ok_or_else(|| {
+                anyhow!(
+                    "{}: unknown section [{name}]; only [devices.<name>] is understood",
+                    place()
+                )
+            })?;
+            let device = unquote(device.trim());
+            if device.is_empty() {
+                bail!("{}: a [devices.<name>] section needs a name", place());
+            }
+            // Re-entering a section adds to it rather than replacing it, which
+            // is what TOML does with a repeated table.
+            config.devices.entry(device.to_string()).or_default();
+            section = Some(device.to_string());
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            bail!("{}: expected `key = value`, got: {line}", place());
+        };
+        let key = key.trim();
+        let value = unquote(value.trim());
+
+        // `default` selects a section, so it belongs to the file rather than to
+        // any one profile.
+        if key == "default" {
+            if section.is_some() {
+                bail!(
+                    "{}: `default` belongs before the first [devices.<name>] section",
+                    place()
+                );
+            }
+            config.default_device = Some(value.to_string());
+            continue;
+        }
+
+        let profile = match &section {
+            Some(name) => config
+                .devices
+                .get_mut(name)
+                .expect("the section was inserted when its header was read"),
+            None => &mut config.defaults,
+        };
+        assign(profile, key, value, &place())?;
+    }
+
+    // A `default` naming nothing is a typo that would otherwise only surface as
+    // the wrong device — or as no device at all — much later.
+    if let Some(name) = &config.default_device
+        && !config.devices.contains_key(name)
+    {
+        bail!(
+            "{}: default = {name:?} names no [devices.{name}] section; {}",
+            config.path.display(),
+            config.device_names()
+        );
+    }
+    Ok(config)
+}
+
+/// Apply one `key = value` pair to `profile`. Unknown keys are hard errors, so
+/// a typo cannot silently leave a default in place.
+fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result<()> {
+    match key {
+        "index" => {
+            profile.connect.index = Some(
+                value
+                    .parse()
+                    .with_context(|| format!("{place}: invalid index: {value}"))?,
+            );
+        }
+        // `Interval` rejects zero and anything below its floor as a parse
+        // error, so there is no separate range check to keep in step with clap's.
+        "interval" => {
+            profile.connect.interval = Some(
+                value
+                    .parse()
+                    .with_context(|| format!("{place}: invalid interval"))?,
+            );
+        }
+        "addr" => {
+            profile.connect.addr = Some(
+                value
+                    .parse()
+                    .map_err(|e| anyhow!("{place}: invalid addr {value}: {e}"))?,
+            );
+        }
+        "socket" => profile.socket = Some(PathBuf::from(value)),
+        _ => bail!("{place}: unknown key: {key}"),
+    }
+    Ok(())
 }
 
 /// Strip one matching pair of double quotes, so `addr = "..."` and `addr = ...`
@@ -570,6 +735,24 @@ mod tests {
         Cli::parse_from(std::iter::once("btwattch2").chain(args.iter().copied()))
     }
 
+    /// Parse `text` as the config file at a throwaway path.
+    fn config(text: &str) -> Result<FileConfig> {
+        parse_config(text, PathBuf::from("config.toml"))
+    }
+
+    /// Resolve `args` against `text` written to a real config file, which is the
+    /// only way through `settings` — it reads the file itself.
+    fn settings(args: &[&str], text: &str) -> Result<Settings> {
+        let temp = crate::agent::testutil::TempPath::new(".toml");
+        std::fs::write(temp.path(), text).unwrap();
+        let path = temp.path().to_str().unwrap().to_string();
+        let args: Vec<&str> = ["-c", &path]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        parse_cli(&args).settings()
+    }
+
     #[test]
     fn unquote_strips_one_pair_only() {
         assert_eq!(unquote("\"abc\""), "abc");
@@ -622,22 +805,37 @@ mod tests {
 
     #[test]
     fn cli_overlays_the_config_file() {
-        let cfg = ConnectOpts {
-            index: Some(1),
-            addr: Some("CB:DF:6B:12:34:56".parse().unwrap()),
-            interval: "9s".parse().ok(),
-        };
+        let text = "index = 1\naddr = \"CB:DF:6B:12:34:56\"\ninterval = 9";
+        let settings = settings(&["-n", "3"], text).unwrap();
         let resolved = parse_cli(&["-n", "3"])
-            .connection_config(Some(&cfg))
+            .connection_config(&settings)
             .unwrap();
-        assert_eq!(resolved.interval, "3s".parse().unwrap());
+        assert_eq!(resolved.interval, "3".parse().unwrap());
         assert_eq!(resolved.index, 1);
-        assert_eq!(resolved.addr, cfg.addr.unwrap());
+        assert_eq!(resolved.addr, "CB:DF:6B:12:34:56".parse().unwrap());
     }
 
     #[test]
     fn connection_config_needs_an_address() {
-        assert!(parse_cli(&[]).connection_config(None).is_err());
+        assert!(
+            parse_cli(&[])
+                .connection_config(&Settings::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn connection_config_defaults_the_interval_and_index() {
+        let settings = Settings {
+            connect: ConnectOpts {
+                addr: "CB:DF:6B:12:34:56".parse().ok(),
+                ..ConnectOpts::default()
+            },
+            ..Settings::default()
+        };
+        let resolved = parse_cli(&[]).connection_config(&settings).unwrap();
+        assert_eq!(resolved.interval, DEFAULT_INTERVAL);
+        assert_eq!(resolved.index, DEFAULT_INDEX);
     }
 
     #[test]
@@ -714,10 +912,7 @@ mod tests {
 
     #[test]
     fn explicit_addr_ignores_the_config_file() {
-        let cfg = ConnectOpts {
-            addr: Some("CB:DF:6B:12:34:56".parse().unwrap()),
-            ..ConnectOpts::default()
-        };
+        let text = "addr = \"CB:DF:6B:12:34:56\"";
         // Only what the command line asked for counts, so a configured address
         // never makes a running agent look like the wrong device.
         assert_eq!(parse_cli(&[]).explicit_addr(), None);
@@ -726,8 +921,8 @@ mod tests {
             "CB:DF:6B:AA:BB:CC".parse().ok()
         );
         assert_eq!(
-            parse_cli(&[]).connection_config(Some(&cfg)).unwrap().addr,
-            cfg.addr.unwrap()
+            settings(&[], text).unwrap().connect.addr,
+            "CB:DF:6B:12:34:56".parse().ok()
         );
     }
 
@@ -765,6 +960,104 @@ mod tests {
             assert_eq!(parsed.to_string(), text);
             assert_eq!(text.parse::<Interval>().unwrap(), parsed);
         }
+    }
+
+    #[test]
+    fn a_file_without_sections_is_the_whole_configuration() {
+        let cfg = config("addr = \"CB:DF:6B:12:34:56\"\ninterval = 500ms").unwrap();
+        let profile = cfg.profile(None).unwrap();
+        assert_eq!(profile.connect.addr, "CB:DF:6B:12:34:56".parse().ok());
+        assert_eq!(profile.connect.interval, "500ms".parse().ok());
+    }
+
+    #[test]
+    fn a_device_section_inherits_the_top_level_keys() {
+        let cfg = config(
+            "interval = 2s\n\
+             [devices.living]\n\
+             addr = \"CB:DF:6B:12:34:56\"\n\
+             [devices.rack]\n\
+             addr = \"CB:DF:6B:AA:BB:CC\"\n\
+             interval = 500ms\n\
+             socket = \"/run/btwattch2/rack.sock\"\n",
+        )
+        .unwrap();
+
+        let living = cfg.profile(Some("living")).unwrap();
+        assert_eq!(living.connect.addr, "CB:DF:6B:12:34:56".parse().ok());
+        assert_eq!(living.connect.interval, "2s".parse().ok());
+        assert_eq!(living.socket, None);
+
+        // The section wins over the inherited default.
+        let rack = cfg.profile(Some("rack")).unwrap();
+        assert_eq!(rack.connect.interval, "500ms".parse().ok());
+        assert_eq!(rack.socket, Some(PathBuf::from("/run/btwattch2/rack.sock")));
+    }
+
+    #[test]
+    fn default_selects_a_section_when_no_device_is_named() {
+        let cfg = config(
+            "default = \"rack\"\n\
+             [devices.living]\n\
+             addr = \"CB:DF:6B:12:34:56\"\n\
+             [devices.rack]\n\
+             addr = \"CB:DF:6B:AA:BB:CC\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.profile(None).unwrap().connect.addr,
+            "CB:DF:6B:AA:BB:CC".parse().ok()
+        );
+        // --device still overrides it.
+        assert_eq!(
+            cfg.profile(Some("living")).unwrap().connect.addr,
+            "CB:DF:6B:12:34:56".parse().ok()
+        );
+    }
+
+    /// Every way of naming a device that does not exist has to fail loudly:
+    /// falling back to the defaults would operate some other meter.
+    #[test]
+    fn a_missing_profile_is_an_error() {
+        let cfg = config("[devices.living]\naddr = \"CB:DF:6B:12:34:56\"").unwrap();
+        let err = cfg.profile(Some("rack")).unwrap_err().to_string();
+        assert!(err.contains("known devices: living"), "{err}");
+
+        assert!(config("default = \"rack\"").is_err());
+        assert!(settings(&["--device", "rack"], "addr = \"CB:DF:6B:12:34:56\"").is_err());
+    }
+
+    #[test]
+    fn config_rejects_malformed_sections_and_keys() {
+        for text in [
+            "[devices.living",
+            "[wattage]",
+            "[devices.]",
+            "[devices.living]\nunknown = 1",
+            "[devices.living]\ndefault = \"living\"",
+            "interval = 0",
+            "addr = nonsense",
+            "just a line",
+        ] {
+            assert!(config(text).is_err(), "accepted {text:?}");
+        }
+    }
+
+    /// A profile supplies the socket, so `--device` alone routes to the right
+    /// agent; an explicit `--socket` still wins.
+    #[test]
+    fn the_profile_supplies_the_socket() {
+        let text = "[devices.rack]\naddr = \"CB:DF:6B:AA:BB:CC\"\nsocket = \"/run/rack.sock\"";
+        let cli = parse_cli(&["--device", "rack"]);
+        let resolved = settings(&["--device", "rack"], text).unwrap();
+        assert_eq!(
+            cli.agent_paths(&resolved).socket,
+            PathBuf::from("/run/rack.sock")
+        );
+
+        let overridden =
+            settings(&["--device", "rack", "--socket", "/run/other.sock"], text).unwrap();
+        assert_eq!(overridden.socket, Some(PathBuf::from("/run/other.sock")));
     }
 
     #[test]

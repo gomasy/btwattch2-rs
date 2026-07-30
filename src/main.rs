@@ -40,18 +40,16 @@ fn main() -> Result<()> {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
-    let paths = cli.agent_paths();
+    // Resolves the config file and the profile `--device` selects, so every
+    // path below — including `agent stop` finding the right socket — agrees on
+    // what device this invocation is about.
+    let settings = cli.settings()?;
+    let paths = cli.agent_paths(&settings);
 
     if let Some(Command::Agent { action }) = &cli.command {
-        let cfg = if matches!(action, AgentAction::Start) {
-            cli.load_config()?
-        } else {
-            None
-        };
-        return run_agent_command(action, &cli, cfg.as_ref(), &paths).await;
+        return run_agent_command(action, &cli, &settings, &paths).await;
     }
 
-    let cfg = cli.load_config()?;
     let mode = cli.mode();
     cli.validate_prefix(&mode)?;
 
@@ -64,7 +62,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         let window = cli
             .duration
             .map_or(DEFAULT_SCAN_WINDOW, Duration::from_secs);
-        let devices = Connection::scan(cli.adapter_index(cfg.as_ref()), window).await?;
+        let devices = Connection::scan(cli.adapter_index(&settings), window).await?;
         print_scan(&devices, scan_mode);
         return Ok(());
     }
@@ -75,7 +73,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         return run_via_daemon(mode, &cli, log_level, &paths).await;
     }
 
-    let mut conn = Connection::new(&cli.connection_config(cfg.as_ref())?).await?;
+    let mut conn = Connection::new(&cli.connection_config(&settings)?).await?;
 
     let result = tokio::select! {
         result = run(&mut conn, mode, &cli, log_level) => result,
@@ -124,12 +122,12 @@ fn warn_ignored_flags(cli: &Cli) {
 async fn run_agent_command(
     action: &AgentAction,
     cli: &Cli,
-    cfg: Option<&cli::ConnectOpts>,
+    settings: &cli::Settings,
     paths: &agent::AgentPaths,
 ) -> Result<()> {
     match action {
         AgentAction::Start => {
-            let conn_cfg = cli.connection_config(cfg)?;
+            let conn_cfg = cli.connection_config(settings)?;
             let log_level = cli.log_level(false);
             connection::set_log_level(log_level);
             agent::server::run(&conn_cfg, paths).await
@@ -154,11 +152,15 @@ async fn run_agent_command(
                     .filter(|pid| !pid.is_empty())
                     .unwrap_or("unknown");
                 println!("Agent is running (pid {pid})");
+                println!("Socket:      {}", paths.socket.display());
                 if let Some(addr) = daemon.addr {
-                    println!("Attached to {addr}");
+                    println!("Attached to: {addr}");
                 }
             } else {
-                println!("Agent is not running");
+                // Name the socket: with a profile per device there are several
+                // an invocation could have meant, and which one was checked is
+                // the first question when the answer is "not running".
+                println!("Agent is not running ({})", paths.socket.display());
             }
             Ok(())
         }
