@@ -1,5 +1,7 @@
-use std::num::NonZeroU64;
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use btleplug::api::BDAddr;
@@ -7,9 +9,66 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeDelta, TimeZone};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_INDEX: usize = 0;
-/// One second. `NonZeroU64::MIN` *is* 1, and spelling it that way keeps the
-/// default free of a const `unwrap`.
-pub const DEFAULT_INTERVAL: NonZeroU64 = NonZeroU64::MIN;
+pub const DEFAULT_INTERVAL: Interval = Interval(Duration::from_secs(1));
+
+/// Shortest polling period accepted. The device answers a measurement request
+/// over BLE, and below a few milliseconds the requests only queue up behind
+/// replies that cannot arrive any faster — so the floor is a guard against a
+/// value that would look like it worked while merely flooding the link.
+const MIN_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long to wait between measurement requests.
+///
+/// A newtype rather than a `Duration`, so "positive and not absurdly small" is
+/// established once at parse time: the value becomes a `tokio::time::interval`
+/// period, which panics on a zero duration. That invariant used to be carried
+/// by `NonZeroU64` seconds, which also ruled out every sub-second period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interval(Duration);
+
+impl Interval {
+    pub fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl FromStr for Interval {
+    type Err = anyhow::Error;
+
+    /// Accepts seconds (`1`, `0.5`, `2s`) or milliseconds (`500ms`).
+    fn from_str(s: &str) -> Result<Self> {
+        let text = s.trim();
+        // `ms` first: `strip_suffix('s')` would otherwise leave a trailing `m`.
+        let (number, scale) = match text.strip_suffix("ms") {
+            Some(number) => (number, 1e-3),
+            None => (text.strip_suffix('s').unwrap_or(text), 1.0),
+        };
+
+        let seconds: f64 = number
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid interval {s:?}: expected 0.5, 500ms, or 2s"))?;
+        let duration = Duration::try_from_secs_f64(seconds * scale)
+            .map_err(|e| anyhow!("invalid interval {s:?}: {e}"))?;
+
+        if duration < MIN_INTERVAL {
+            bail!("interval {s:?} is shorter than the {MIN_INTERVAL:?} minimum");
+        }
+        Ok(Self(duration))
+    }
+}
+
+/// `Duration`'s own `Debug` is the format wanted here — `1s`, `500ms`, `1.5s` —
+/// and it round-trips through `FromStr` above.
+impl fmt::Display for Interval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+fn parse_interval(s: &str) -> Result<Interval> {
+    s.parse()
+}
 
 /// How measurements are rendered to stdout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -74,9 +133,9 @@ pub struct ConnectOpts {
     #[arg(short, long, value_name = "addr")]
     pub addr: Option<BDAddr>,
 
-    /// Specify the seconds to wait between updates [default: 1].
-    #[arg(short = 'n', long, value_name = "second(s)")]
-    pub interval: Option<NonZeroU64>,
+    /// Specify the time to wait between updates, e.g. 2s or 500ms [default: 1s].
+    #[arg(short = 'n', long, value_name = "interval", value_parser = parse_interval)]
+    pub interval: Option<Interval>,
 }
 
 impl ConnectOpts {
@@ -95,10 +154,10 @@ impl ConnectOpts {
 pub struct ConnectionConfig {
     pub index: usize,
     pub addr: BDAddr,
-    /// Non-zero by construction: it becomes a `tokio::time::interval` period,
+    /// Positive by construction: it becomes a `tokio::time::interval` period,
     /// which panics on a zero duration. Enforcing it in the type keeps that out
     /// of reach instead of resting on the two parsers that feed this struct.
-    pub interval: NonZeroU64,
+    pub interval: Interval,
 }
 
 /// Toolkit for the RS-BTWATTCH2 Bluetooth power meter.
@@ -391,12 +450,15 @@ impl Cli {
                             .with_context(|| format!("{}: invalid index: {value}", place()))?,
                     )
                 }
-                // `NonZeroU64` rejects 0 as a parse error, so there is no
-                // separate range check to keep in step with clap's.
+                // `Interval` rejects zero and anything below its floor as a
+                // parse error, so there is no separate range check to keep in
+                // step with clap's.
                 "interval" => {
-                    cfg.interval = Some(value.parse().with_context(|| {
-                        format!("{}: invalid interval (must be 1 or more): {value}", place())
-                    })?)
+                    cfg.interval = Some(
+                        value
+                            .parse()
+                            .with_context(|| format!("{}: invalid interval", place()))?,
+                    )
                 }
                 "addr" => {
                     cfg.addr = Some(
@@ -563,12 +625,12 @@ mod tests {
         let cfg = ConnectOpts {
             index: Some(1),
             addr: Some("CB:DF:6B:12:34:56".parse().unwrap()),
-            interval: NonZeroU64::new(9),
+            interval: "9s".parse().ok(),
         };
         let resolved = parse_cli(&["-n", "3"])
             .connection_config(Some(&cfg))
             .unwrap();
-        assert_eq!(resolved.interval.get(), 3);
+        assert_eq!(resolved.interval, "3s".parse().unwrap());
         assert_eq!(resolved.index, 1);
         assert_eq!(resolved.addr, cfg.addr.unwrap());
     }
@@ -670,8 +732,39 @@ mod tests {
     }
 
     #[test]
-    fn interval_must_be_at_least_one() {
+    fn interval_accepts_sub_second_periods() {
+        for (text, expected) in [
+            ("1", Duration::from_secs(1)),
+            ("2s", Duration::from_secs(2)),
+            ("0.5", Duration::from_millis(500)),
+            ("0.5s", Duration::from_millis(500)),
+            ("500ms", Duration::from_millis(500)),
+            (" 250 ms ", Duration::from_millis(250)),
+        ] {
+            let parsed: Interval = text.parse().unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(parsed.duration(), expected, "parsing {text:?}");
+        }
+    }
+
+    /// Zero would panic `tokio::time::interval`, and the rest are values that
+    /// would otherwise be silently truncated or accepted as nonsense.
+    #[test]
+    fn interval_rejects_zero_and_junk() {
+        for text in ["0", "0s", "0ms", "1ms", "-1", "", "abc", "1m", "NaN", "inf"] {
+            assert!(text.parse::<Interval>().is_err(), "accepted {text:?}");
+        }
         assert!(Cli::try_parse_from(["btwattch2", "-n", "0"]).is_err());
+    }
+
+    /// The format is what `FromStr` accepts, so status output can be pasted
+    /// back into `--interval`.
+    #[test]
+    fn interval_display_round_trips() {
+        for text in ["1s", "500ms", "1.5s"] {
+            let parsed: Interval = text.parse().unwrap();
+            assert_eq!(parsed.to_string(), text);
+            assert_eq!(text.parse::<Interval>().unwrap(), parsed);
+        }
     }
 
     #[test]

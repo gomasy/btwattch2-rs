@@ -30,8 +30,8 @@ Commands:
 Options:
   -i, --index <index>       Specify adapter index, e.g. hci0 [default: 0]
   -a, --addr <addr>         Specify the destination address
-  -n, --interval <second(s)>
-                             Specify the seconds to wait between updates [default: 1]
+  -n, --interval <interval> Specify the time to wait between updates,
+                             e.g. 2s or 500ms [default: 1s]
   -c, --config <path>       Path to a config file (TOML-like `key = value`)
   --on                      Turn on the power switch
   --off                     Turn off the power switch
@@ -72,7 +72,9 @@ F4:12:00:AB:CD:EF    (unknown)       rssi=-88
 
 ### Measurement
 
-Run with `--addr` set to the Bluetooth address of the device, and measurements are printed every `--interval` seconds (default: 1 second).
+Run with `--addr` set to the Bluetooth address of the device, and measurements are printed every `--interval` (default: 1 second).
+
+`--interval` accepts seconds or milliseconds — `2s`, `0.5`, `500ms` — down to a floor of 10 ms. Sub-second polling is useful for catching inrush current and switching transients, but the device answers each request over BLE at its own pace: ask faster than it can reply and the extra requests only queue behind replies that cannot arrive any sooner.
 
 ```console
 # btwattch2 --addr CB:DF:6B:12:34:56
@@ -229,7 +231,7 @@ Connection defaults can be stored in a config file so you don't have to pass `--
 # ~/.config/btwattch2/config.toml
 addr = "CB:DF:6B:12:34:56"
 index = 0
-interval = 1
+interval = 1s
 ```
 
 ### Verbosity

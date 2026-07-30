@@ -194,7 +194,7 @@ impl Connection {
         Ok(Self {
             name,
             addr: opts.addr,
-            interval: Duration::from_secs(opts.interval.get()),
+            interval: opts.interval.duration(),
             device,
             tx,
             rx,
