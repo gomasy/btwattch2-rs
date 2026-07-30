@@ -48,8 +48,10 @@ fn field_names() -> impl Iterator<Item = &'static str> {
 /// sample per line as it streams, timestamp included, for a textfile collector.
 /// A scraped endpoint reports the *current* reading, so it carries no per-sample
 /// timestamp — a scraper stamps what it reads, and a stale sample is better
-/// described by `up 0` than by a backdated one it may refuse outright. The
-/// channel list, names, and help strings are the same either way.
+/// described by `up 0` than by a backdated one it may refuse outright. Session
+/// energy is left out for the same reason: it is accumulated per run by a
+/// streaming client, so a scrape has no run to read it from. The channel list,
+/// names, and help strings are otherwise the same either way.
 ///
 /// `sample` is the latest measurement, `up` whether it is fresh enough to stand
 /// for the device's present state. When it is not, the channels are omitted
