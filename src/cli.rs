@@ -19,12 +19,23 @@ pub const DEFAULT_INTERVAL: Interval = Interval(Duration::from_secs(1));
 /// value that would look like it worked while merely flooding the link.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Longest polling period accepted. Nothing about the device argues for a
+/// particular ceiling; this one exists so the value stays a duration arithmetic
+/// can be done on. `AgentStats` derives its freshness window by multiplying the
+/// interval, and `Duration`'s multiplication panics on overflow — which
+/// `try_from_secs_f64` alone leaves reachable, since it accepts durations within
+/// a factor of two of `Duration::MAX`. A day is far beyond any interval worth
+/// polling a power meter at.
+const MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How long to wait between measurement requests.
 ///
-/// A newtype rather than a `Duration`, so "positive and not absurdly small" is
-/// established once at parse time: the value becomes a `tokio::time::interval`
-/// period, which panics on a zero duration. That invariant used to be carried
-/// by `NonZeroU64` seconds, which also ruled out every sub-second period.
+/// A newtype rather than a `Duration`, so "positive, and neither absurdly small
+/// nor absurdly large" is established once at parse time: the value becomes a
+/// `tokio::time::interval` period, which panics on a zero duration, and gets
+/// multiplied to derive the agent's freshness window, which panics on overflow.
+/// The lower bound used to be carried by `NonZeroU64` seconds, which also ruled
+/// out every sub-second period.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interval(Duration);
 
@@ -59,6 +70,9 @@ impl FromStr for Interval {
 
         if duration < MIN_INTERVAL {
             bail!("interval {s:?} is shorter than the {MIN_INTERVAL:?} minimum");
+        }
+        if duration > MAX_INTERVAL {
+            bail!("interval {s:?} is longer than the {MAX_INTERVAL:?} maximum");
         }
         Ok(Self(duration))
     }
@@ -741,10 +755,6 @@ pub fn local_datetime(naive: NaiveDateTime) -> Option<DateTime<Local>> {
 }
 
 fn parse_time(s: &str) -> Result<DateTime<Local>> {
-    if let Ok(time) = DateTime::parse_from_rfc3339(s) {
-        return Ok(time.with_timezone(&Local));
-    }
-
     const FORMATS: &[&str] = &[
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
@@ -753,11 +763,22 @@ fn parse_time(s: &str) -> Result<DateTime<Local>> {
         "%Y/%m/%d %H:%M",
     ];
 
-    FORMATS
-        .iter()
-        .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
-        .and_then(local_datetime)
-        .ok_or_else(|| anyhow!("unrecognized time format: {s}"))
+    let time = match DateTime::parse_from_rfc3339(s) {
+        Ok(time) => time.with_timezone(&Local),
+        Err(_) => FORMATS
+            .iter()
+            .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
+            .and_then(local_datetime)
+            .ok_or_else(|| anyhow!("unrecognized time format: {s}"))?,
+    };
+
+    // A year the device cannot store is rejected here, before anything connects,
+    // for the same reason `validate_prefix` is: waiting through a BLE connect to
+    // be told the value was never going to work is the wrong order. Checked by
+    // building the real frame, so the range stays with the wire layout rather
+    // than being copied into a second place that can drift.
+    crate::payload::rtc(&time)?;
+    Ok(time)
 }
 
 #[cfg(test)]
@@ -928,6 +949,16 @@ mod tests {
         assert!(parse_time("yesterday").is_err());
     }
 
+    /// The device stores the year in one byte, so a time it cannot hold has to
+    /// fail at parse time rather than after a connect that was never going to
+    /// end in the clock being set.
+    #[test]
+    fn parse_time_rejects_a_year_the_device_cannot_store() {
+        assert!(parse_time("2156-01-02 03:04:05").is_err());
+        assert!(parse_time("1899-01-02T03:04:05+09:00").is_err());
+        assert!(parse_time("2155-01-02 03:04:05").is_ok());
+    }
+
     /// Drives the SIGPIPE choice, so only the long-running daemon may say yes:
     /// a CLI wants a closed pipe to be fatal, the agent must survive one.
     #[test]
@@ -976,12 +1007,27 @@ mod tests {
 
     /// Zero would panic `tokio::time::interval`, and the rest are values that
     /// would otherwise be silently truncated or accepted as nonsense.
+    ///
+    /// The oversized ones matter for the same reason as zero: `try_from_secs_f64`
+    /// accepts up to `Duration::MAX`, and tripling one of those to derive the
+    /// agent's freshness window panics.
     #[test]
     fn interval_rejects_zero_and_junk() {
-        for text in ["0", "0s", "0ms", "1ms", "-1", "", "abc", "1m", "NaN", "inf"] {
+        for text in [
+            "0", "0s", "0ms", "1ms", "-1", "", "abc", "1m", "NaN", "inf", "86401", "1e19",
+        ] {
             assert!(text.parse::<Interval>().is_err(), "accepted {text:?}");
         }
         assert!(Cli::try_parse_from(["btwattch2", "-n", "0"]).is_err());
+    }
+
+    /// The bounds are inclusive, so the values the errors name are themselves
+    /// accepted.
+    #[test]
+    fn interval_accepts_both_bounds() {
+        for text in ["10ms", "86400"] {
+            assert!(text.parse::<Interval>().is_ok(), "rejected {text:?}");
+        }
     }
 
     /// The format is what `FromStr` accepts, so status output can be pasted

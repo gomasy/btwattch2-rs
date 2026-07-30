@@ -403,7 +403,7 @@ impl Connection {
     }
 
     pub async fn set_rtc(&mut self, time: &DateTime<Local>) -> Result<()> {
-        self.command(payload::rtc(time), "RTC set").await
+        self.command(payload::rtc(time)?, "RTC set").await
     }
 
     pub async fn power(&mut self, on: bool) -> Result<()> {

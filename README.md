@@ -75,7 +75,7 @@ F4:12:00:AB:CD:EF    (unknown)       rssi=-88
 
 Run with `--addr` set to the Bluetooth address of the device, and measurements are printed every `--interval` (default: 1 second).
 
-`--interval` accepts seconds or milliseconds — `2s`, `0.5`, `500ms` — down to a floor of 10 ms. Sub-second polling is useful for catching inrush current and switching transients, but the device answers each request over BLE at its own pace: ask faster than it can reply and the extra requests only queue behind replies that cannot arrive any sooner.
+`--interval` accepts seconds or milliseconds — `2s`, `0.5`, `500ms` — between a floor of 10 ms and a ceiling of a day. Sub-second polling is useful for catching inrush current and switching transients, but the device answers each request over BLE at its own pace: ask faster than it can reply and the extra requests only queue behind replies that cannot arrive any sooner.
 
 ```console
 # btwattch2 --addr CB:DF:6B:12:34:56

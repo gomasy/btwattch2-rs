@@ -819,13 +819,20 @@ impl Actor {
                 self.command(&payload::blink_led(), &cmd.tx).await;
             }
 
-            Request::SetRtc { time } => match chrono::DateTime::parse_from_rfc3339(&time) {
-                Ok(t) => {
-                    let p = payload::rtc(&t.with_timezone(&chrono::Local));
-                    self.command(&p, &cmd.tx).await;
+            // Both the parse and the frame can reject the time — the wire format
+            // carries the year in a single byte — and either way the client is
+            // owed the reason rather than a command that sets the wrong clock.
+            Request::SetRtc { time } => {
+                let frame = chrono::DateTime::parse_from_rfc3339(&time)
+                    .map_err(|e| format!("invalid time: {e}"))
+                    .and_then(|t| {
+                        payload::rtc(&t.with_timezone(&chrono::Local)).map_err(|e| e.to_string())
+                    });
+                match frame {
+                    Ok(p) => self.command(&p, &cmd.tx).await,
+                    Err(e) => send_error(&cmd.tx, e),
                 }
-                Err(e) => send_error(&cmd.tx, format!("invalid time: {e}")),
-            },
+            }
         }
     }
 

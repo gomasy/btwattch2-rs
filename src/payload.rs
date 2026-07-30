@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, Local, Timelike};
 
 /// Every frame, in both directions, starts with this byte.
@@ -11,17 +12,30 @@ const TURN_OFF: [u8; 2] = [0xA7, 0x00];
 const TURN_ON: [u8; 2] = [0xA7, 0x01];
 const BLINK_LED: [u8; 5] = [0x3E, 0x01, 0x02, 0x02, 0x0F];
 
-pub fn rtc(time: &DateTime<Local>) -> Vec<u8> {
-    generate(&[
+/// The frame that sets the device clock.
+///
+/// Fails on a year the wire format cannot carry. The field is a single byte of
+/// `year - 1900`, so anything outside 1900..=2155 would otherwise wrap silently
+/// and set the device to a different year than the one asked for — the one
+/// failure mode a clock-setting command must not have.
+pub fn rtc(time: &DateTime<Local>) -> Result<Vec<u8>> {
+    let Ok(year) = u8::try_from(time.year() - 1900) else {
+        bail!(
+            "cannot set the RTC to {}: the device carries a year as `year - 1900` \
+             in one byte, so only 1900 through 2155 can be expressed",
+            time.year()
+        );
+    };
+    Ok(generate(&[
         RTC_TIMER,
         time.second() as u8,
         time.minute() as u8,
         time.hour() as u8,
         time.day() as u8,
         (time.month() - 1) as u8,
-        (time.year() - 1900) as u8,
+        year,
         time.weekday().num_days_from_sunday() as u8,
-    ])
+    ]))
 }
 
 pub fn monitoring() -> Vec<u8> {
@@ -87,10 +101,25 @@ mod tests {
         assert_eq!(crc8(&[]), 0x00);
     }
 
+    /// A year the single-byte field cannot carry has to be an error rather than
+    /// a frame that sets the device to some other year.
+    #[test]
+    fn rtc_rejects_a_year_the_wire_cannot_carry() {
+        for year in [1899, 2156] {
+            let time = Local.with_ymd_and_hms(year, 1, 2, 3, 4, 5).unwrap();
+            assert!(rtc(&time).is_err(), "accepted {year}");
+        }
+        // The bounds themselves are expressible.
+        for year in [1900, 2155] {
+            let time = Local.with_ymd_and_hms(year, 1, 2, 3, 4, 5).unwrap();
+            assert!(rtc(&time).is_ok(), "rejected {year}");
+        }
+    }
+
     #[test]
     fn rtc_frame_layout() {
         let time = Local.with_ymd_and_hms(2021, 1, 2, 3, 4, 5).unwrap();
-        let frame = rtc(&time);
+        let frame = rtc(&time).unwrap();
 
         // header + size (BE) + payload (8 bytes) + crc
         assert_eq!(frame.len(), 12);
