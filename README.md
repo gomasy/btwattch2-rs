@@ -40,6 +40,7 @@ Options:
   --test-led                Blink the LED on the main unit
   --metric-name <name>      Print a measurement as Mackerel custom metrics and exit
   --scan                    Scan for nearby BTWATTCH2 devices and list them, then exit
+  --scan-all                Scan like --scan, but list every Bluetooth device
   --get-rtc                 Read the device RTC and report its drift from the system clock
   --format <format>         How to render measurements
                              [plain|json|csv|ltsv|prometheus|mackerel]
@@ -53,11 +54,20 @@ Options:
 
 ### Discovering the device (`--scan`)
 
-List nearby Bluetooth devices (address, name, RSSI) without connecting. Useful for finding the `addr` to pass to the other commands. Only devices currently advertising are listed: BlueZ also remembers everything it has ever seen, and those would otherwise pad the results with neighbours long out of range.
+List nearby watt checkers (address, name, RSSI) without connecting. Useful for finding the `addr` to pass to the other commands. Only devices currently advertising are listed: BlueZ also remembers everything it has ever seen, and those would otherwise pad the results with neighbours long out of range.
 
 ```console
 # btwattch2 --scan
 CB:DF:6B:12:34:56    RS-BTWATTCH2    rssi=-62
+[INFO] 7 other device(s) hidden; use --scan-all to list them
+```
+
+Devices are recognised by their advertised name, so anything that has not sent one yet is counted as hidden rather than listed. Use `--scan-all` to see every device instead — worth trying if a meter you expect does not appear:
+
+```console
+# btwattch2 --scan-all
+CB:DF:6B:12:34:56    RS-BTWATTCH2    rssi=-62
+F4:12:00:AB:CD:EF    (unknown)       rssi=-88
 ```
 
 ### Measurement

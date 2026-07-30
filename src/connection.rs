@@ -86,6 +86,23 @@ pub struct ScannedDevice {
     pub rssi: i16,
 }
 
+/// What the device calls itself in its advertisement.
+const DEVICE_NAME: &str = "BTWATTCH2";
+
+impl ScannedDevice {
+    /// Whether this looks like a watt checker. Matched on the advertised name
+    /// rather than the address, since the address prefix belongs to the module
+    /// vendor and is shared with unrelated hardware.
+    ///
+    /// A device whose name has not arrived yet cannot be recognised and so is
+    /// not claimed to be one; `--scan-all` is the way to see those.
+    pub fn is_watt_checker(&self) -> bool {
+        self.name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_uppercase().contains(DEVICE_NAME))
+    }
+}
+
 /// Which reply a one-shot write is waiting for. The two are told apart by
 /// length alone, since a streaming measurement can arrive while a one-shot
 /// command is in flight.
@@ -662,6 +679,25 @@ fn u48_le(payload: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
+
+    fn scanned(name: Option<&str>) -> ScannedDevice {
+        ScannedDevice {
+            addr: "CB:DF:6B:12:34:56".parse().unwrap(),
+            name: name.map(str::to_string),
+            rssi: -60,
+        }
+    }
+
+    #[test]
+    fn watt_checkers_are_recognised_by_name() {
+        for name in ["RS-BTWATTCH2", "btwattch2", "RS-BTWATTCH2-1234"] {
+            assert!(scanned(Some(name)).is_watt_checker(), "rejected {name}");
+        }
+        // A nameless advertisement cannot be identified either way.
+        for name in [Some("RS-WFWATTCH1"), Some("Some Speaker"), None] {
+            assert!(!scanned(name).is_watt_checker(), "accepted {name:?}");
+        }
+    }
 
     #[test]
     fn u48_le_is_little_endian() {

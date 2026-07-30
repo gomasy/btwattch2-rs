@@ -151,6 +151,11 @@ pub struct Cli {
     #[arg(long, group = "mode")]
     pub scan: bool,
 
+    /// Scan like --scan, but list every Bluetooth device rather than only
+    /// watt checkers.
+    #[arg(long, group = "mode")]
+    pub scan_all: bool,
+
     /// Read the device RTC and report its drift from the system clock.
     #[arg(long, group = "mode")]
     pub get_rtc: bool,
@@ -203,7 +208,16 @@ pub enum AgentAction {
     Status,
 }
 
-/// What the invocation asks the tool to do, `--scan` aside (main handles it
+/// Which devices a scan reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Only devices whose advertised name marks them as a watt checker.
+    WattCheckers,
+    /// Every device currently advertising.
+    Everything,
+}
+
+/// What the invocation asks the tool to do, the scans aside (main handles those
 /// before connecting). The clap `mode` group guarantees at most one of the
 /// flags below is set.
 #[derive(Debug)]
@@ -236,6 +250,17 @@ impl Cli {
                 action: AgentAction::Start
             })
         )
+    }
+
+    /// Whether this invocation only lists nearby devices, and whether it wants
+    /// the unfiltered list. `--scan` names watt checkers alone, as its help says;
+    /// `--scan-all` is the escape hatch for a device whose name has not arrived.
+    pub fn scan_mode(&self) -> Option<ScanMode> {
+        match (self.scan, self.scan_all) {
+            (true, _) => Some(ScanMode::WattCheckers),
+            (_, true) => Some(ScanMode::Everything),
+            _ => None,
+        }
     }
 
     /// The address named on the command line, ignoring the config file. Only an
@@ -647,5 +672,20 @@ mod tests {
     #[test]
     fn interval_must_be_at_least_one() {
         assert!(Cli::try_parse_from(["btwattch2", "-n", "0"]).is_err());
+    }
+
+    #[test]
+    fn scan_mode_distinguishes_the_two_scans() {
+        assert_eq!(parse_cli(&[]).scan_mode(), None);
+        assert_eq!(
+            parse_cli(&["--scan"]).scan_mode(),
+            Some(ScanMode::WattCheckers)
+        );
+        assert_eq!(
+            parse_cli(&["--scan-all"]).scan_mode(),
+            Some(ScanMode::Everything)
+        );
+        // Both at once is a contradiction the mode group rejects.
+        assert!(Cli::try_parse_from(["btwattch2", "--scan", "--scan-all"]).is_err());
     }
 }

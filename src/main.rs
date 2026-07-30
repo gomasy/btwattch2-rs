@@ -15,7 +15,7 @@ use chrono::Local;
 use clap::Parser;
 
 use agent::protocol::{Request, Response};
-use cli::{AgentAction, Cli, Command, LogLevel, Mode};
+use cli::{AgentAction, Cli, Command, LogLevel, Mode, ScanMode};
 use connection::{Connection, Measurement, ScannedDevice};
 use output::StreamRenderer;
 use signal::Sigpipe;
@@ -60,12 +60,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
     let log_level = cli.log_level(matches!(mode, Mode::Metric(_)));
     connection::set_log_level(log_level);
 
-    if cli.scan {
+    if let Some(scan_mode) = cli.scan_mode() {
         let window = cli
             .duration
             .map_or(DEFAULT_SCAN_WINDOW, Duration::from_secs);
         let devices = Connection::scan(cli.adapter_index(cfg.as_ref()), window).await?;
-        print_scan(&devices);
+        print_scan(&devices, scan_mode);
         return Ok(());
     }
 
@@ -272,13 +272,25 @@ async fn run(conn: &mut Connection, mode: Mode, cli: &Cli, log_level: LogLevel) 
     }
 }
 
-fn print_scan(devices: &[ScannedDevice]) {
-    if devices.is_empty() {
+fn print_scan(devices: &[ScannedDevice], mode: ScanMode) {
+    let listed: Vec<&ScannedDevice> = devices
+        .iter()
+        .filter(|d| mode == ScanMode::Everything || d.is_watt_checker())
+        .collect();
+
+    if listed.is_empty() {
         println!("No devices found.");
-        return;
     }
-    for d in devices {
+    for d in &listed {
         let name = d.name.as_deref().unwrap_or("(unknown)");
         println!("{}\t{}\trssi={}", d.addr, name, d.rssi);
+    }
+
+    // Say what was left out, so a meter whose name never arrived does not look
+    // like a meter that is not there. Informational, so `--quiet` drops it and
+    // the device list stays the only thing on stdout either way.
+    let hidden = devices.len() - listed.len();
+    if hidden > 0 && connection::info_enabled() {
+        eprintln!("[INFO] {hidden} other device(s) hidden; use --scan-all to list them");
     }
 }
