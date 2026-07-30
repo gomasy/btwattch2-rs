@@ -637,10 +637,10 @@ fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
         }
 
         let profile = match &section {
-            Some(name) => config
-                .devices
-                .get_mut(name)
-                .expect("the section was inserted when its header was read"),
+            // The header already inserted this entry, so `or_default` never
+            // fires; going back through the entry API rather than unwrapping a
+            // lookup keeps that a property of the code instead of a claim.
+            Some(name) => config.devices.entry(name.clone()).or_default(),
             None => &mut config.defaults,
         };
         assign(profile, key, value, &place())?;
