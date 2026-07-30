@@ -349,6 +349,7 @@ async fn accept_loop(
                     }
                     Err(e) => {
                         eprintln!("[WARN] Accept failed: {e}");
+                        tokio::time::sleep(super::ACCEPT_BACKOFF).await;
                     }
                 }
             }

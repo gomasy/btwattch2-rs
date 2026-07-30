@@ -45,9 +45,7 @@ pub async fn serve(listener: TcpListener, stats: Arc<AgentStats>) {
             }
             Err(e) => {
                 eprintln!("[WARN] Metrics accept failed: {e}");
-                // Out of descriptors fails instantly and would otherwise spin
-                // this loop at the speed of the log writes.
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(super::ACCEPT_BACKOFF).await;
             }
         }
     }

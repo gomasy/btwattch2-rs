@@ -462,6 +462,11 @@ impl Connection {
         let mut notifications = self.listen().await?;
         let mut assembler = FrameAssembler::new();
         let mut ticker = tokio::time::interval(self.interval);
+        // A poll that overruns its period — a write retrying through a reconnect,
+        // say — must not leave a backlog of ticks to fire back-to-back once it
+        // returns. The default would answer a minute of failed writes with a
+        // minute of instant retries; the agent's ticker is set up the same way.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {

@@ -5,8 +5,15 @@ pub mod server;
 pub mod status;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use btleplug::api::BDAddr;
+
+/// How long an accept loop waits after a failed `accept`. Running out of
+/// descriptors fails instantly and for as long as the shortage lasts, so an
+/// unpaused loop would spin at the speed of its own log writes. Shared by both
+/// listeners, since neither has a reason to pick a different number.
+pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Fallback runtime directory when `$XDG_RUNTIME_DIR` is unset. The agent needs
 /// raw BLE access and so runs as root; `/run` is root-owned and lives on a
