@@ -707,10 +707,14 @@ impl Actor {
         // An aborted stream leaves no subscription behind. Nobody else will take
         // one out when the endpoint is what keeps the polling going, so recover
         // here rather than waiting for a client that may never arrive.
+        //
+        // Routed through `abort_stream` rather than just logged, so a link this
+        // agent cannot subscribe to is not still reported as connected by
+        // `agent status` — which is the one thing that field exists to say.
         if self.notifications.is_none()
             && let Err(e) = self.relisten().await
         {
-            eprintln!("[ERR] {e}");
+            self.abort_stream(e);
             return;
         }
 
