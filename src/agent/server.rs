@@ -3,6 +3,7 @@ use std::io::Write;
 use std::ops::ControlFlow;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use btleplug::api::{BDAddr, ValueNotification};
@@ -71,8 +72,8 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     // the actor can finish in-flight work, and `notify_one` leaves a permit
     // behind when the target is momentarily not parked on `notified()`, which
     // a shared `notify_waiters` would drop on the floor.
-    let shutdown = std::sync::Arc::new(Notify::new());
-    let actor_shutdown = std::sync::Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+    let actor_shutdown = Arc::new(Notify::new());
 
     let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone()));
     let result = tokio::select! {
@@ -203,7 +204,7 @@ fn write_pid_file(path: &Path) -> Result<()> {
 async fn accept_loop(
     listener: UnixListener,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
-    shutdown: std::sync::Arc<Notify>,
+    shutdown: Arc<Notify>,
     addr: BDAddr,
     mut signals: Shutdown,
 ) -> Result<()> {
@@ -235,7 +236,7 @@ async fn accept_loop(
 async fn handle_client(
     stream: UnixStream,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
-    shutdown: std::sync::Arc<Notify>,
+    shutdown: Arc<Notify>,
     addr: BDAddr,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -319,9 +320,74 @@ async fn send_response(
     Ok(())
 }
 
-/// A failure that costs us the notification stream. The streaming client is
+/// A failure that costs us the notification stream. The streaming clients are
 /// dropped and the link re-established on the next request.
 type StreamError = String;
+
+/// The clients currently streaming measurements.
+///
+/// A list rather than the single slot this used to be: the device is polled once
+/// per interval whatever the audience, so a second subscriber costs nothing and
+/// no longer has to be turned away.
+struct Clients {
+    list: Vec<mpsc::UnboundedSender<Response>>,
+}
+
+impl Clients {
+    fn new() -> Self {
+        Self { list: Vec::new() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    fn add(&mut self, tx: mpsc::UnboundedSender<Response>) {
+        self.list.push(tx);
+    }
+
+    /// Hand `response` to everyone still listening.
+    fn broadcast(&mut self, response: &Response) {
+        let mut hung_up = false;
+        for tx in &self.list {
+            // One departure must not interrupt anyone else's feed, so the
+            // failures are collected and swept up afterwards.
+            hung_up |= tx.send(response.clone()).is_err();
+        }
+        if hung_up {
+            self.reap();
+        }
+    }
+
+    /// Drop the clients that have hung up. Doing this eagerly rather than
+    /// waiting for the next failed send keeps `Subscribe` from having to guess
+    /// whether the list still describes who is listening.
+    fn reap(&mut self) {
+        self.list.retain(|tx| !tx.is_closed());
+    }
+
+    /// Report a failure to everyone and forget them.
+    fn abort(&mut self, reason: &StreamError) {
+        for tx in self.take() {
+            tx.send(Response::Error {
+                message: reason.clone(),
+            })
+            .ok();
+        }
+    }
+
+    /// Tell everyone the stream is over and forget them. They read a closed
+    /// socket as a protocol error, not as a normal stop.
+    fn end(&mut self) {
+        for tx in self.take() {
+            tx.send(Response::StreamEnd).ok();
+        }
+    }
+
+    fn take(&mut self) -> Vec<mpsc::UnboundedSender<Response>> {
+        std::mem::take(&mut self.list)
+    }
+}
 
 /// What woke the actor loop. The select! only *produces* these; acting on one
 /// happens afterwards, so the handler can borrow the actor exclusively.
@@ -332,21 +398,22 @@ enum Event {
 }
 
 /// Owns the single BLE connection and serializes every client request onto it.
-/// At most one client streams measurements at a time; one-shot commands are
-/// interleaved on the same link.
+/// Any number of clients stream measurements at once, all fed from the same poll;
+/// one-shot commands are interleaved on the same link.
 struct Actor {
     conn: Connection,
     notifications: Option<Notifications>,
     assembler: FrameAssembler,
     ticker: tokio::time::Interval,
-    streaming_client: Option<mpsc::UnboundedSender<Response>>,
+    /// Everyone currently subscribed; one poll of the device answers all of them.
+    clients: Clients,
     monitoring_payload: Vec<u8>,
 }
 
 async fn actor_loop(
     conn: Connection,
     mut cmd_rx: mpsc::UnboundedReceiver<ActorCommand>,
-    shutdown: std::sync::Arc<Notify>,
+    shutdown: Arc<Notify>,
 ) {
     let mut actor = Actor::new(conn);
 
@@ -354,7 +421,7 @@ async fn actor_loop(
         let event = tokio::select! {
             _ = shutdown.notified() => break,
             cmd = cmd_rx.recv() => Event::Command(cmd),
-            _ = actor.ticker.tick(), if actor.streaming_client.is_some() => Event::Tick,
+            _ = actor.ticker.tick(), if !actor.clients.is_empty() => Event::Tick,
             event = next_notification(&mut actor.notifications) => Event::Notification(event),
         };
 
@@ -372,9 +439,8 @@ async fn actor_loop(
         }
     }
 
-    // However the loop ended, the streaming client is owed a clean end: it
-    // reads a closed socket as a protocol error, not as a normal stop.
-    end_stream(&mut actor.streaming_client);
+    // However the loop ended, the streaming clients are owed a clean end.
+    actor.clients.end();
     tokio::time::timeout(COMMAND_TIMEOUT, actor.conn.disconnect())
         .await
         .ok();
@@ -406,7 +472,7 @@ impl Actor {
             notifications: None,
             assembler: FrameAssembler::new(),
             ticker,
-            streaming_client: None,
+            clients: Clients::new(),
             monitoring_payload: payload::monitoring(),
         }
     }
@@ -431,40 +497,19 @@ impl Actor {
         }
     }
 
-    /// Forget the current stream, returning the client that was on it. Every
-    /// path that gives up on streaming goes through here, so what "torn down"
-    /// means stays in one place.
-    fn drop_stream(&mut self) -> Option<mpsc::UnboundedSender<Response>> {
-        self.notifications = None;
-        self.streaming_client.take()
-    }
-
-    /// Tear the streaming state down and report the failure to the client.
+    /// Tear the streaming state down and report the failure to every client.
+    /// Every path that gives up on streaming goes through here, so what "torn
+    /// down" means stays in one place.
     fn abort_stream(&mut self, reason: StreamError) {
         eprintln!("[ERR] {reason}");
-        if let Some(tx) = self.drop_stream() {
-            tx.send(Response::Error { message: reason }).ok();
-        }
-    }
-
-    /// Drop a streaming client that has hung up. The actor otherwise only finds
-    /// out when the next measurement fails to send, which leaves `Subscribe`
-    /// rejecting a new client for up to a full interval — long enough for two
-    /// back-to-back `--metric-name` runs to collide.
-    fn reap_streaming_client(&mut self) {
-        if self
-            .streaming_client
-            .as_ref()
-            .is_some_and(|tx| tx.is_closed())
-        {
-            self.drop_stream();
-        }
+        self.notifications = None;
+        self.clients.abort(&reason);
     }
 
     /// Ask the device for a measurement. Only runs while a client is streaming.
     async fn poll_device(&mut self) {
-        self.reap_streaming_client();
-        if self.streaming_client.is_none() {
+        self.clients.reap();
+        if self.clients.is_empty() {
             return;
         }
 
@@ -495,29 +540,20 @@ impl Actor {
             return;
         }
 
-        let Some(tx) = self.streaming_client.clone() else {
-            return;
-        };
-
-        let mut hung_up = false;
-        for frame in self.assembler.feed(&event.value) {
+        let Self {
+            assembler, clients, ..
+        } = self;
+        for frame in assembler.feed(&event.value) {
             let Some(m) = connection::try_measurement(&frame) else {
                 continue;
             };
-            // The client hung up mid-stream.
-            if tx.send(Response::from_measurement(&m)).is_err() {
-                hung_up = true;
-                break;
-            }
-        }
-        if hung_up {
-            self.drop_stream();
+            clients.broadcast(&Response::from_measurement(&m));
         }
     }
 
     /// Serve one client request.
     async fn handle(&mut self, cmd: ActorCommand) {
-        self.reap_streaming_client();
+        self.clients.reap();
 
         match cmd.request {
             // `handle_client` answers these itself so they stay responsive
@@ -525,13 +561,23 @@ impl Actor {
             Request::Ping | Request::Shutdown => {}
 
             Request::Subscribe => {
-                if self.streaming_client.is_some() {
-                    send_error(&cmd.tx, "another client is already streaming".to_string());
-                } else if let Err(e) = self.relisten().await {
+                // Whether anything was being polled before this client arrived.
+                let idle = self.clients.is_empty();
+                // A subscription already in place is reused: taking out another
+                // would discard a part-received frame and cost the clients
+                // already streaming a sample.
+                if self.notifications.is_none()
+                    && let Err(e) = self.relisten().await
+                {
                     send_error(&cmd.tx, e);
-                } else {
+                    return;
+                }
+                self.clients.add(cmd.tx);
+                // Only a client that starts the polling waits on the ticker's
+                // own schedule. Resetting it for a later arrival would push back
+                // the sample the others are already waiting for.
+                if idle {
                     self.ticker.reset();
-                    self.streaming_client = Some(cmd.tx);
                 }
             }
 
@@ -628,7 +674,7 @@ impl Actor {
         let Self {
             notifications,
             assembler,
-            streaming_client,
+            clients,
             ..
         } = self;
         let Some(notifications) = notifications.as_mut() else {
@@ -636,12 +682,10 @@ impl Actor {
         };
 
         let wait = connection::next_matching_frame(notifications, assembler, &kind, |frame| {
-            if let Some(tx) = &*streaming_client
-                && let Some(m) = connection::try_measurement(frame)
-            {
+            if let Some(m) = connection::try_measurement(frame) {
                 // A hung-up client is reaped on the next request; here the
                 // command reply is what matters.
-                tx.send(Response::from_measurement(&m)).ok();
+                clients.broadcast(&Response::from_measurement(&m));
             }
         });
 
@@ -671,18 +715,105 @@ fn reply(tx: &mpsc::UnboundedSender<Response>, result: Result<Response, StreamEr
     tx.send(resp).ok();
 }
 
-fn end_stream(client: &mut Option<mpsc::UnboundedSender<Response>>) {
-    if let Some(tx) = client.take() {
-        tx.send(Response::StreamEnd).ok();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::super::testutil::TempPath;
     use super::*;
+
+    /// A subscriber and the receiving end it would be streaming to.
+    fn subscriber() -> (
+        mpsc::UnboundedSender<Response>,
+        mpsc::UnboundedReceiver<Response>,
+    ) {
+        mpsc::unbounded_channel()
+    }
+
+    fn wattage(resp: &Response) -> Option<f64> {
+        match resp {
+            Response::Measurement { wattage, .. } => Some(*wattage),
+            _ => None,
+        }
+    }
+
+    /// A measurement as it travels: built through the real conversion, so the
+    /// fan-out is exercised on the shape clients actually receive.
+    fn sample(wattage: f64) -> Response {
+        Response::from_measurement(&crate::connection::testutil::measurement(wattage))
+    }
+
+    /// The point of the client list: one poll of the device feeds everyone, so
+    /// concurrent subscribers no longer have to be turned away.
+    #[test]
+    fn every_client_gets_every_measurement() {
+        let mut clients = Clients::new();
+
+        let (tx_a, mut rx_a) = subscriber();
+        let (tx_b, mut rx_b) = subscriber();
+        clients.add(tx_a);
+        clients.add(tx_b);
+
+        clients.broadcast(&sample(42.0));
+        assert_eq!(rx_a.try_recv().map(|r| wattage(&r)), Ok(Some(42.0)));
+        assert_eq!(rx_b.try_recv().map(|r| wattage(&r)), Ok(Some(42.0)));
+    }
+
+    /// One client hanging up must not cost the others a sample.
+    #[test]
+    fn a_departure_does_not_disturb_the_rest() {
+        let mut clients = Clients::new();
+
+        let (tx_gone, rx_gone) = subscriber();
+        let (tx_stays, mut rx_stays) = subscriber();
+        clients.add(tx_gone);
+        clients.add(tx_stays);
+        drop(rx_gone);
+
+        clients.broadcast(&sample(1.0));
+        clients.broadcast(&sample(2.0));
+
+        assert_eq!(rx_stays.try_recv().map(|r| wattage(&r)), Ok(Some(1.0)));
+        assert_eq!(rx_stays.try_recv().map(|r| wattage(&r)), Ok(Some(2.0)));
+        clients.reap();
+        assert!(!clients.is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_reported_to_everyone() {
+        let mut clients = Clients::new();
+        let (tx_a, mut rx_a) = subscriber();
+        let (tx_b, mut rx_b) = subscriber();
+        clients.add(tx_a);
+        clients.add(tx_b);
+
+        clients.abort(&"link went away".to_string());
+
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(Response::Error { message }) if message == "link went away"
+            ));
+        }
+        assert!(clients.is_empty());
+    }
+
+    /// A closed socket reads as a protocol error at the far end, so shutdown
+    /// owes every client an explicit end.
+    #[test]
+    fn shutdown_ends_every_stream() {
+        let mut clients = Clients::new();
+        let (tx_a, mut rx_a) = subscriber();
+        let (tx_b, mut rx_b) = subscriber();
+        clients.add(tx_a);
+        clients.add(tx_b);
+
+        clients.end();
+
+        assert!(matches!(rx_a.try_recv(), Ok(Response::StreamEnd)));
+        assert!(matches!(rx_b.try_recv(), Ok(Response::StreamEnd)));
+        assert!(clients.is_empty());
+    }
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path)

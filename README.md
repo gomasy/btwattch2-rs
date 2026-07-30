@@ -192,6 +192,8 @@ Every command normally connects and disconnects BLE, which takes several seconds
 # btwattch2 agent stop
 ```
 
+Any number of commands may stream at once. The device is polled once per interval however many are listening, and each measurement is handed to all of them, so a live `btwattch2 --count 5` and a periodic `--metric-name` run no longer collide.
+
 The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
 
 ```console

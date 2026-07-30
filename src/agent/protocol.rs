@@ -14,7 +14,9 @@ pub enum Request {
     Shutdown,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Cloneable so one measurement can be handed to every streaming client without
+/// re-deriving it per client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Ok,
