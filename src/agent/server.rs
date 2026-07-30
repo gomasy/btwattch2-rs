@@ -28,9 +28,18 @@ struct AgentInfo {
     stats: Arc<AgentStats>,
 }
 
+/// How many measurements may queue for one client before it is dropped.
+///
+/// The queue absorbs a client that is briefly slow to read its socket. Past that
+/// it would be absorbing one that has stopped reading altogether — and since
+/// nothing bounds how long that lasts, an unbounded queue turns a single wedged
+/// subscriber into unbounded memory in the agent. Sized for a minute at the
+/// default one-second interval.
+const CLIENT_QUEUE_LEN: usize = 64;
+
 struct ActorCommand {
     request: Request,
-    tx: mpsc::UnboundedSender<Response>,
+    tx: mpsc::Sender<Response>,
 }
 
 /// Owns the socket and pid file for as long as the agent is serving. Every exit
@@ -323,7 +332,7 @@ async fn handle_client(
         return;
     }
 
-    let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<Response>();
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Response>(CLIENT_QUEUE_LEN);
     let cmd = ActorCommand {
         request,
         tx: resp_tx,
@@ -390,7 +399,7 @@ type StreamError = String;
 /// no longer has to be turned away. Owning the reported count alongside the list
 /// is what keeps `agent status` from drifting out of step with it.
 struct Clients {
-    list: Vec<mpsc::UnboundedSender<Response>>,
+    list: Vec<mpsc::Sender<Response>>,
     stats: Arc<AgentStats>,
 }
 
@@ -406,21 +415,40 @@ impl Clients {
         self.list.is_empty()
     }
 
-    fn add(&mut self, tx: mpsc::UnboundedSender<Response>) {
+    fn add(&mut self, tx: mpsc::Sender<Response>) {
         self.list.push(tx);
         self.publish_count();
     }
 
-    /// Hand `response` to everyone still listening.
+    /// Hand `response` to everyone still listening. One client going away must
+    /// not interrupt anyone else's feed, so every send is attempted and the
+    /// departures are swept up in the same pass.
     fn broadcast(&mut self, response: &Response) {
-        let mut hung_up = false;
-        for tx in &self.list {
-            // One departure must not interrupt anyone else's feed, so the
-            // failures are collected and swept up afterwards.
-            hung_up |= tx.send(response.clone()).is_err();
+        let before = self.list.len();
+        let mut lagging = 0;
+
+        self.list.retain(|tx| match tx.try_send(response.clone()) {
+            Ok(()) => true,
+            // Hung up.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            // Still connected, but no longer reading its socket. Waiting for it
+            // would hold samples for a client that may never read again, and
+            // holding them is what an unbounded queue did; dropping it closes the
+            // socket, which is how it learns its feed ended.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                lagging += 1;
+                false
+            }
+        });
+
+        if lagging > 0 {
+            eprintln!(
+                "[WARN] Dropped {lagging} client(s) that stopped reading, \
+                 having fallen {CLIENT_QUEUE_LEN} measurements behind"
+            );
         }
-        if hung_up {
-            self.reap();
+        if self.list.len() != before {
+            self.publish_count();
         }
     }
 
@@ -433,10 +461,12 @@ impl Clients {
         }
     }
 
-    /// Report a failure to everyone and forget them.
+    /// Report a failure to everyone and forget them. Best-effort: a client whose
+    /// queue is full has stopped reading, and dropping its sender tells it the
+    /// same thing the message would have.
     fn abort(&mut self, reason: &StreamError) {
         for tx in self.take() {
-            tx.send(Response::Error {
+            tx.try_send(Response::Error {
                 message: reason.clone(),
             })
             .ok();
@@ -447,11 +477,11 @@ impl Clients {
     /// socket as a protocol error, not as a normal stop.
     fn end(&mut self) {
         for tx in self.take() {
-            tx.send(Response::StreamEnd).ok();
+            tx.try_send(Response::StreamEnd).ok();
         }
     }
 
-    fn take(&mut self) -> Vec<mpsc::UnboundedSender<Response>> {
+    fn take(&mut self) -> Vec<mpsc::Sender<Response>> {
         let previous = std::mem::take(&mut self.list);
         self.publish_count();
         previous
@@ -730,7 +760,7 @@ impl Actor {
     }
 
     /// Send a one-shot command frame and reply with its status byte.
-    async fn command(&mut self, cmd_payload: &[u8], tx: &mpsc::UnboundedSender<Response>) {
+    async fn command(&mut self, cmd_payload: &[u8], tx: &mpsc::Sender<Response>) {
         let resp = self
             .oneshot(cmd_payload, FrameKind::Command)
             .await
@@ -824,13 +854,15 @@ fn parse_command_result(frame: &[u8]) -> Response {
     }
 }
 
-fn send_error(tx: &mpsc::UnboundedSender<Response>, message: String) {
-    tx.send(Response::Error { message }).ok();
+fn send_error(tx: &mpsc::Sender<Response>, message: String) {
+    tx.try_send(Response::Error { message }).ok();
 }
 
-fn reply(tx: &mpsc::UnboundedSender<Response>, result: Result<Response, StreamError>) {
+/// Answer a one-shot request. `try_send` cannot fail for want of room here: the
+/// channel is this request's own, and one reply is all that is ever put in it.
+fn reply(tx: &mpsc::Sender<Response>, result: Result<Response, StreamError>) {
     let resp = result.unwrap_or_else(|message| Response::Error { message });
-    tx.send(resp).ok();
+    tx.try_send(resp).ok();
 }
 
 #[cfg(test)]
@@ -845,11 +877,8 @@ mod tests {
     }
 
     /// A subscriber and the receiving end it would be streaming to.
-    fn subscriber() -> (
-        mpsc::UnboundedSender<Response>,
-        mpsc::UnboundedReceiver<Response>,
-    ) {
-        mpsc::unbounded_channel()
+    fn subscriber() -> (mpsc::Sender<Response>, mpsc::Receiver<Response>) {
+        mpsc::channel(CLIENT_QUEUE_LEN)
     }
 
     fn wattage(resp: &Response) -> Option<f64> {
@@ -903,6 +932,33 @@ mod tests {
         assert_eq!(rx_stays.try_recv().map(|r| wattage(&r)), Ok(Some(2.0)));
         assert_eq!(stats.snapshot().clients, 1);
         assert!(!clients.is_empty());
+    }
+
+    /// The bound is the point: a client that stops reading is dropped rather than
+    /// queued for without limit, and the others carry on unaffected.
+    #[test]
+    fn a_client_that_stops_reading_is_dropped_not_queued_for() {
+        let stats = test_stats();
+        let mut clients = Clients::new(Arc::clone(&stats));
+
+        let (tx_stuck, _rx_stuck) = subscriber();
+        let (tx_reads, mut rx_reads) = subscriber();
+        clients.add(tx_stuck);
+        clients.add(tx_reads);
+
+        // `_rx_stuck` is held but never read, so its queue fills; the other end
+        // is drained every round, so it never does.
+        for i in 0..CLIENT_QUEUE_LEN + 1 {
+            clients.broadcast(&sample(i as f64));
+            assert_eq!(rx_reads.try_recv().map(|r| wattage(&r)), Ok(Some(i as f64)));
+        }
+
+        assert_eq!(
+            stats.snapshot().clients,
+            1,
+            "the stuck client is still held"
+        );
+        assert!(!clients.is_empty(), "the reading client was not disturbed");
     }
 
     #[test]

@@ -194,6 +194,8 @@ Every command normally connects and disconnects BLE, which takes several seconds
 
 Any number of commands may stream at once. The device is polled once per interval however many are listening, and each measurement is handed to all of them, so a live `btwattch2 --count 5` and a periodic `--metric-name` run no longer collide.
 
+A client that stops reading its end is dropped once it falls 64 measurements behind, with a warning on the agent's stderr. The agent will not hold samples indefinitely for one wedged subscriber, and the clients still reading are unaffected.
+
 #### Status
 
 ```console
