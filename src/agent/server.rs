@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io::Write;
 use std::ops::ControlFlow;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -47,11 +48,93 @@ struct ActorCommand {
 /// — has to take both files with it, and a guard is the only way to say that
 /// once rather than at each `return`. Removal only; whether the agent stopped
 /// cleanly or never got going is `run`'s to report, not a destructor's.
-struct AgentFiles<'a>(&'a super::AgentPaths);
+struct AgentFiles<'a> {
+    paths: &'a super::AgentPaths,
+    /// Held for the guard's lifetime, so the claim on the pid file lasts exactly
+    /// as long as the agent is serving.
+    pid: PidFile,
+}
+
+impl<'a> AgentFiles<'a> {
+    fn new(paths: &'a super::AgentPaths, pid: PidFile) -> Self {
+        Self { paths, pid }
+    }
+
+    /// Record our pid, now that the agent is committed to serving.
+    fn write_pid(&self) -> Result<()> {
+        self.pid.write(&self.paths.pid)
+    }
+}
 
 impl Drop for AgentFiles<'_> {
     fn drop(&mut self) {
-        self.0.remove_files();
+        self.paths.remove_files();
+    }
+}
+
+/// The agent's pid file, held open for as long as the agent runs.
+///
+/// The open file is itself the claim: an exclusive `flock` on it is what tells a
+/// live agent from a file a dead one left behind, and the kernel drops it however
+/// the process exits. A pid *written inside* a file cannot do that job — it can
+/// name a recycled pid, it can be edited or removed, and two agents starting at
+/// the same moment can both read it, both conclude nothing is running, and unlink
+/// each other's socket on the way to binding their own.
+#[derive(Debug)]
+struct PidFile(std::fs::File);
+
+impl PidFile {
+    /// Claim the pid file, failing when another agent already holds it.
+    ///
+    /// The open refuses to follow a symlink: `--pid-file` can name any path, so
+    /// someone who can predict it must not be able to turn the write into a
+    /// clobber of an unrelated file the agent happens to be able to write.
+    ///
+    /// Nothing is written yet. The startup checks after this one can still bail,
+    /// and until they pass, whatever a previous agent left in the file says more
+    /// than a pid of ours that is about to stop being true.
+    fn claim(paths: &super::AgentPaths) -> Result<Self> {
+        let path = &paths.pid;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+
+        // SAFETY: `flock` on a descriptor this function owns and keeps alive for
+        // the returned value's lifetime.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Self(file));
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            match paths.read_pid() {
+                Some(pid) => bail!("agent is already running (pid {pid})"),
+                None => bail!("agent is already running"),
+            }
+        }
+        // A filesystem that cannot lock is not worth refusing to start over: the
+        // socket probe below still catches the ordinary case, and this is the
+        // same trade as a signal handler that fails to register.
+        eprintln!(
+            "[WARN] Failed to lock {}: {error}; a concurrent `agent start` will not be detected",
+            path.display()
+        );
+        Ok(Self(file))
+    }
+
+    /// Write our pid over whatever the file held.
+    fn write(&self, path: &Path) -> Result<()> {
+        let mut file = &self.0;
+        file.set_len(0)
+            .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()))
+            .and_then(|()| file.flush())
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -68,12 +151,20 @@ pub async fn run(
     // a signal arriving earlier is queued rather than lost.
     let mut signals = Shutdown::new();
 
-    cleanup_stale(paths).await?;
+    // The directory first: the pid file the claim below opens lives in it.
     ensure_socket_dir(sock)?;
+    // Before anything is unlinked, so two agents starting at once cannot each
+    // decide the other is not there.
+    let pid_file = PidFile::claim(paths)?;
+    cleanup_stale(paths).await?;
+    // Before the bind, not after: claiming the pid file created it, so from here
+    // on a failure has a file to take with it. `cleanup_stale` has already
+    // unlinked any leftover socket, so there is never one of someone else's for
+    // this guard to remove.
+    let files = AgentFiles::new(paths, pid_file);
     let listener =
         UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?;
-    let _files = AgentFiles(paths);
-    write_pid_file(&paths.pid)?;
+    files.write_pid()?;
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
@@ -206,34 +297,23 @@ impl Shutdown {
     }
 }
 
-/// Refuse to start when a previous agent is still alive, and clear its leftover
-/// files when it is not.
+/// Refuse to start when a previous agent is still alive, and clear the socket it
+/// left behind when it is not.
 ///
-/// A live pid is not proof on its own — pids get recycled, and a leftover file
-/// naming an unrelated process must not lock the agent out of ever starting
-/// again — so it counts only when it still belongs to a btwattch2. That check is
-/// a cheap `/proc` read taken first; a socket that answers is the authority and
-/// is consulted whenever the pid file leaves any doubt, including when it names
-/// a process that is not ours. Skipping the socket in that case would let a
-/// second agent unlink a live one's socket and fight it for the device.
+/// The pid file claim has already ruled out another agent that takes it. A socket
+/// that answers is what catches the one case it cannot: an agent from before the
+/// claim existed, still holding the device across an upgrade in place. Skipping
+/// that check would let this agent unlink a live one's socket and fight it for
+/// the device.
 async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
-    if let Some(pid) = paths.read_pid().filter(|&pid| is_agent_process(pid)) {
-        bail!("agent is already running (pid {pid})");
-    }
     if super::probe_daemon(paths).await.is_some() {
         bail!("agent is already running");
     }
 
-    paths.remove_files();
+    // The socket alone: the pid file is the one this process holds the claim on,
+    // and it is rewritten rather than removed.
+    std::fs::remove_file(&paths.socket).ok();
     Ok(())
-}
-
-/// Whether `pid` names a live process running this same program. Comparing
-/// `comm` is what tells a still-running agent apart from a recycled pid.
-fn is_agent_process(pid: u32) -> bool {
-    let ours = std::fs::read_to_string("/proc/self/comm");
-    let theirs = std::fs::read_to_string(format!("/proc/{pid}/comm"));
-    matches!((ours, theirs), (Ok(ours), Ok(theirs)) if ours == theirs)
 }
 
 /// Create the socket's parent directory, private to us. The default runtime
@@ -248,21 +328,6 @@ fn ensure_socket_dir(sock: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("failed to create {}", dir.display()))
-}
-
-/// Write the pid file, refusing to follow a symlink. `--pid-file` can name any
-/// path, so an attacker who can predict it must not be able to turn the write
-/// into a clobber of an unrelated file the agent happens to be able to write.
-fn write_pid_file(path: &Path) -> Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut file| file.write_all(std::process::id().to_string().as_bytes()))
-        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 async fn accept_loop(
@@ -1060,14 +1125,59 @@ mod tests {
             & 0o777
     }
 
+    /// Paths whose pid file is the temp path itself, so the guard cleans it up.
+    fn pid_paths(temp: &TempPath) -> super::super::AgentPaths {
+        super::super::paths_from_socket(temp.path().with_extension("sock"))
+    }
+
     #[test]
     fn pid_file_is_written_private() {
         let temp = TempPath::new(".pid");
-        write_pid_file(temp.path()).unwrap();
+        let paths = pid_paths(&temp);
 
-        let paths = super::super::paths_from_socket(temp.path().with_extension("sock"));
+        let claim = PidFile::claim(&paths).unwrap();
+        claim.write(&paths.pid).unwrap();
+
         assert_eq!(paths.read_pid(), Some(std::process::id()));
         assert_eq!(mode_of(temp.path()), 0o600);
+    }
+
+    /// The pid file is a claim rather than a note: while one agent holds it, no
+    /// second agent may start, whatever the file happens to contain. This is what
+    /// two `agent start`s racing each other come down to — without it both read
+    /// the file, both conclude nothing is running, and both unlink the other's
+    /// socket.
+    #[test]
+    fn the_pid_file_is_an_exclusive_claim() {
+        let temp = TempPath::new(".pid");
+        let paths = pid_paths(&temp);
+
+        let held = PidFile::claim(&paths).expect("the first claim succeeds");
+        held.write(&paths.pid).unwrap();
+
+        let err = PidFile::claim(&paths).unwrap_err().to_string();
+        assert!(err.contains("already running"), "{err}");
+        assert!(
+            err.contains(&std::process::id().to_string()),
+            "the holder's pid names who to go and look at: {err}"
+        );
+
+        // Released with the file — by the kernel, so however the holder exits.
+        drop(held);
+        assert!(PidFile::claim(&paths).is_ok());
+    }
+
+    /// A stale pid file must not lock the agent out for good: nothing holds the
+    /// claim, so it is taken and overwritten.
+    #[test]
+    fn a_leftover_pid_file_is_claimed_and_overwritten() {
+        let temp = TempPath::new(".pid");
+        let paths = pid_paths(&temp);
+        std::fs::write(temp.path(), b"999999").unwrap();
+
+        let claim = PidFile::claim(&paths).expect("nothing holds a leftover file");
+        claim.write(&paths.pid).unwrap();
+        assert_eq!(paths.read_pid(), Some(std::process::id()));
     }
 
     /// `cleanup_stale` normally unlinks a planted symlink before we get here.
@@ -1080,7 +1190,7 @@ mod tests {
         std::fs::write(&victim, b"untouched").unwrap();
         std::os::unix::fs::symlink(&victim, temp.path()).unwrap();
 
-        assert!(write_pid_file(temp.path()).is_err());
+        assert!(PidFile::claim(&pid_paths(&temp)).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     }
 
@@ -1097,18 +1207,6 @@ mod tests {
             std::fs::write(temp.path(), junk).unwrap();
             assert_eq!(paths.read_pid(), None, "accepted {junk:?}");
         }
-    }
-
-    #[test]
-    fn our_own_pid_is_recognised_as_an_agent() {
-        assert!(is_agent_process(std::process::id()));
-    }
-
-    /// The check that keeps a recycled pid in a leftover file from locking the
-    /// agent out for good. Pid 1 is always live and never a btwattch2.
-    #[test]
-    fn an_unrelated_live_process_is_not_an_agent() {
-        assert!(!is_agent_process(1));
     }
 
     #[test]

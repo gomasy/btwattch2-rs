@@ -278,7 +278,7 @@ RuntimeDirectoryMode=0700
 ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
 ```
 
-The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM.
+The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM. While it runs it holds an exclusive lock on the pid file, so a second `agent start` on the same paths fails with `agent is already running (pid N)` rather than unlinking the first one's socket — including when the two are started at the same moment. The kernel releases the lock however the agent exits, so a pid file left behind by a crash never locks the agent out of starting again.
 
 > **Upgrading:** the socket protocol changed between 1.0 and 1.1, so **restart the agent when you replace the binary**. A client and an agent from those two versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected. Later additions to the protocol are backward compatible — a new client asking an older agent for its status simply gets the fields that agent knows about — but the agent still has to be restarted to serve the metrics endpoint or report the new status fields.
 
