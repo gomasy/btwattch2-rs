@@ -1,6 +1,7 @@
 pub mod client;
 pub mod protocol;
 pub mod server;
+pub mod status;
 
 use std::path::{Path, PathBuf};
 
@@ -61,11 +62,14 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// What a live agent reported about itself when it answered a ping.
+#[derive(Debug)]
 pub struct DaemonInfo {
     /// The device the agent is attached to, or `None` from an agent too old to
     /// report one. Clients compare it against an explicit `--addr` so a command
     /// meant for one device is not silently served by an agent holding another.
     pub addr: Option<BDAddr>,
+    /// The agent's own counters, or `None` from an agent too old to report them.
+    pub status: Option<protocol::AgentStatus>,
 }
 
 /// Probe the agent socket, yielding `Some` only when an agent answers.
@@ -73,10 +77,7 @@ pub async fn probe_daemon(paths: &AgentPaths) -> Option<DaemonInfo> {
     if !paths.socket.exists() {
         return None;
     }
-    client::ping(paths)
-        .await
-        .ok()
-        .map(|addr| DaemonInfo { addr })
+    client::ping(paths).await.ok()
 }
 
 /// Temp paths and cleanup shared by this module's test suites, so `client` and

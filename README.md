@@ -194,6 +194,25 @@ Every command normally connects and disconnects BLE, which takes several seconds
 
 Any number of commands may stream at once. The device is polled once per interval however many are listening, and each measurement is handed to all of them, so a live `btwattch2 --count 5` and a periodic `--metric-name` run no longer collide.
 
+#### Status
+
+```console
+# btwattch2 agent status
+Agent is running (pid 2417)
+Socket:      /run/btwattch2/btwattch2.sock
+Attached to: CB:DF:6B:12:34:56
+Link:        connected
+Interval:    1s
+Uptime:      3h 12m 4s
+Samples:     11524 (last 0.9s ago)
+Reconnects:  3
+Clients:     1
+```
+
+`Link` is the state worth watching: an agent whose BLE link has dropped keeps answering commands, and every one of them fails until it recovers. `Reconnects` counts the links re-established since start — a number that keeps climbing points at range or interference rather than at the tool.
+
+The counters are read from shared state rather than from the connection actor, so `agent status` answers immediately even while the agent is blocked on the link — which is exactly when it is worth asking.
+
 The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
 
 ```console

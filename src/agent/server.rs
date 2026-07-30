@@ -14,6 +14,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 
 use super::protocol::{Request, Response};
+use super::status::AgentStats;
 use crate::cli::ConnectionConfig;
 use crate::connection::{
     self, COMMAND_TIMEOUT, Connection, FrameAssembler, FrameKind, Notifications,
@@ -29,6 +30,13 @@ struct ActorCommand {
 /// path below — an early `?`, a signal during the initial connect, `agent stop`
 /// — has to take both files with it, and a guard is the only way to say that
 /// once rather than at each `return`. Removal only; whether the agent stopped
+/// What the connection handlers need to answer a request without troubling the
+/// actor: which device this agent holds, and its live counters.
+struct AgentInfo {
+    addr: BDAddr,
+    stats: Arc<AgentStats>,
+}
+
 /// cleanly or never got going is `run`'s to report, not a destructor's.
 struct AgentFiles<'a>(&'a super::AgentPaths);
 
@@ -56,6 +64,8 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
+    let stats = Arc::new(AgentStats::new(config.interval));
+
     // Connecting can take tens of seconds of scanning and retries. Watch for a
     // signal throughout, so a Ctrl-C here runs the cleanup above instead of
     // killing the process outright and stranding the socket and pid file.
@@ -67,6 +77,11 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
         }
     };
 
+    // The link is up before anything has been read from it, so record it here:
+    // otherwise an agent sitting idle with a healthy connection would report
+    // itself as disconnected until the first measurement.
+    stats.set_connected(true);
+
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
     // Two separate signals rather than one: the accept loop must stop first so
     // the actor can finish in-flight work, and `notify_one` leaves a permit
@@ -75,9 +90,14 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     let shutdown = Arc::new(Notify::new());
     let actor_shutdown = Arc::new(Notify::new());
 
-    let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone()));
+    let info = Arc::new(AgentInfo {
+        addr: config.addr,
+        stats: Arc::clone(&stats),
+    });
+
+    let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone(), stats));
     let result = tokio::select! {
-        result = accept_loop(listener, cmd_tx.clone(), shutdown, config.addr, signals) => result,
+        result = accept_loop(listener, cmd_tx.clone(), shutdown, info, signals) => result,
         actor_result = &mut actor => {
             actor_result.context("agent actor failed")?;
             bail!("agent actor stopped unexpectedly");
@@ -205,7 +225,7 @@ async fn accept_loop(
     listener: UnixListener,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown: Arc<Notify>,
-    addr: BDAddr,
+    info: Arc<AgentInfo>,
     mut signals: Shutdown,
 ) -> Result<()> {
     tokio::select! {
@@ -215,7 +235,8 @@ async fn accept_loop(
                     Ok((stream, _)) => {
                         let tx = cmd_tx.clone();
                         let shutdown = shutdown.clone();
-                        tokio::spawn(handle_client(stream, tx, shutdown, addr));
+                        let info = Arc::clone(&info);
+                        tokio::spawn(handle_client(stream, tx, shutdown, info));
                     }
                     Err(e) => {
                         eprintln!("[WARN] Accept failed: {e}");
@@ -237,7 +258,7 @@ async fn handle_client(
     stream: UnixStream,
     cmd_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown: Arc<Notify>,
-    addr: BDAddr,
+    info: Arc<AgentInfo>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -258,7 +279,7 @@ async fn handle_client(
         }
     };
 
-    if let Some(response) = control_response(&request, cmd_tx.is_closed(), addr) {
+    if let Some(response) = control_response(&request, cmd_tx.is_closed(), &info) {
         if send_response(&mut writer, &response).await.is_ok()
             && matches!(request, Request::Shutdown)
         {
@@ -294,15 +315,18 @@ async fn handle_client(
 /// The requests the connection handler answers itself, so `agent status` and
 /// `agent stop` stay responsive while the actor is busy on the BLE link.
 /// `None` means the request is actor-bound work.
-fn control_response(request: &Request, actor_gone: bool, addr: BDAddr) -> Option<Response> {
+fn control_response(request: &Request, actor_gone: bool, info: &AgentInfo) -> Option<Response> {
     match request {
         Request::Ping if actor_gone => Some(Response::Error {
             message: "agent actor is not running".to_string(),
         }),
         // The address rides along on the pong so a client can tell whether the
-        // agent it found is holding the device its --addr asked for.
+        // agent it found is holding the device its --addr asked for; the status
+        // is read from shared counters, which is why answering here does not
+        // mean answering with less.
         Request::Ping => Some(Response::Pong {
-            addr: Some(addr.to_string()),
+            addr: Some(info.addr.to_string()),
+            status: Some(info.stats.snapshot()),
         }),
         Request::Shutdown => Some(Response::Ok),
         _ => None,
@@ -328,14 +352,19 @@ type StreamError = String;
 ///
 /// A list rather than the single slot this used to be: the device is polled once
 /// per interval whatever the audience, so a second subscriber costs nothing and
-/// no longer has to be turned away.
+/// no longer has to be turned away. Owning the reported count alongside the list
+/// is what keeps `agent status` from drifting out of step with it.
 struct Clients {
     list: Vec<mpsc::UnboundedSender<Response>>,
+    stats: Arc<AgentStats>,
 }
 
 impl Clients {
-    fn new() -> Self {
-        Self { list: Vec::new() }
+    fn new(stats: Arc<AgentStats>) -> Self {
+        Self {
+            list: Vec::new(),
+            stats,
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -344,6 +373,7 @@ impl Clients {
 
     fn add(&mut self, tx: mpsc::UnboundedSender<Response>) {
         self.list.push(tx);
+        self.publish_count();
     }
 
     /// Hand `response` to everyone still listening.
@@ -360,10 +390,12 @@ impl Clients {
     }
 
     /// Drop the clients that have hung up. Doing this eagerly rather than
-    /// waiting for the next failed send keeps `Subscribe` from having to guess
-    /// whether the list still describes who is listening.
+    /// waiting for the next failed send keeps the reported count current.
     fn reap(&mut self) {
-        self.list.retain(|tx| !tx.is_closed());
+        if self.list.iter().any(|tx| tx.is_closed()) {
+            self.list.retain(|tx| !tx.is_closed());
+            self.publish_count();
+        }
     }
 
     /// Report a failure to everyone and forget them.
@@ -385,7 +417,13 @@ impl Clients {
     }
 
     fn take(&mut self) -> Vec<mpsc::UnboundedSender<Response>> {
-        std::mem::take(&mut self.list)
+        let previous = std::mem::take(&mut self.list);
+        self.publish_count();
+        previous
+    }
+
+    fn publish_count(&self) {
+        self.stats.set_clients(self.list.len());
     }
 }
 
@@ -408,14 +446,16 @@ struct Actor {
     /// Everyone currently subscribed; one poll of the device answers all of them.
     clients: Clients,
     monitoring_payload: Vec<u8>,
+    stats: Arc<AgentStats>,
 }
 
 async fn actor_loop(
     conn: Connection,
     mut cmd_rx: mpsc::UnboundedReceiver<ActorCommand>,
     shutdown: Arc<Notify>,
+    stats: Arc<AgentStats>,
 ) {
-    let mut actor = Actor::new(conn);
+    let mut actor = Actor::new(conn, stats);
 
     loop {
         let event = tokio::select! {
@@ -465,15 +505,16 @@ async fn next_notification(notifications: &mut Option<Notifications>) -> Option<
 }
 
 impl Actor {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, stats: Arc<AgentStats>) -> Self {
         let ticker = tokio::time::interval(conn.interval());
         Self {
             conn,
             notifications: None,
             assembler: FrameAssembler::new(),
             ticker,
-            clients: Clients::new(),
+            clients: Clients::new(Arc::clone(&stats)),
             monitoring_payload: payload::monitoring(),
+            stats,
         }
     }
 
@@ -503,6 +544,7 @@ impl Actor {
     fn abort_stream(&mut self, reason: StreamError) {
         eprintln!("[ERR] {reason}");
         self.notifications = None;
+        self.stats.set_connected(false);
         self.clients.abort(&reason);
     }
 
@@ -516,6 +558,7 @@ impl Actor {
         match self.conn.write(&self.monitoring_payload).await {
             // A reconnect along the way invalidated the old subscription.
             Ok(true) => {
+                self.stats.record_reconnect();
                 if let Err(e) = self.relisten().await {
                     self.abort_stream(e);
                 }
@@ -528,7 +571,10 @@ impl Actor {
     async fn handle_notification(&mut self, event: Option<ValueNotification>) {
         let Some(event) = event else {
             match self.conn.reconnect_stream().await {
-                Ok(n) => self.apply_subscription(n),
+                Ok(n) => {
+                    self.stats.record_reconnect();
+                    self.apply_subscription(n);
+                }
                 // `reconnect_stream` already logged the "[WARN] ... reconnecting"
                 // line; surface the fatal failure and tear the stream down.
                 Err(e) => self.abort_stream(format!("reconnect failed: {e}")),
@@ -541,12 +587,16 @@ impl Actor {
         }
 
         let Self {
-            assembler, clients, ..
+            assembler,
+            clients,
+            stats,
+            ..
         } = self;
         for frame in assembler.feed(&event.value) {
             let Some(m) = connection::try_measurement(&frame) else {
                 continue;
             };
+            stats.record_sample();
             clients.broadcast(&Response::from_measurement(&m));
         }
     }
@@ -675,6 +725,7 @@ impl Actor {
             notifications,
             assembler,
             clients,
+            stats,
             ..
         } = self;
         let Some(notifications) = notifications.as_mut() else {
@@ -683,6 +734,7 @@ impl Actor {
 
         let wait = connection::next_matching_frame(notifications, assembler, &kind, |frame| {
             if let Some(m) = connection::try_measurement(frame) {
+                stats.record_sample();
                 // A hung-up client is reaped on the next request; here the
                 // command reply is what matters.
                 clients.broadcast(&Response::from_measurement(&m));
@@ -722,6 +774,10 @@ mod tests {
     use super::super::testutil::TempPath;
     use super::*;
 
+    fn test_stats() -> Arc<AgentStats> {
+        Arc::new(AgentStats::new("1s".parse().unwrap()))
+    }
+
     /// A subscriber and the receiving end it would be streaming to.
     fn subscriber() -> (
         mpsc::UnboundedSender<Response>,
@@ -747,22 +803,26 @@ mod tests {
     /// concurrent subscribers no longer have to be turned away.
     #[test]
     fn every_client_gets_every_measurement() {
-        let mut clients = Clients::new();
+        let stats = test_stats();
+        let mut clients = Clients::new(Arc::clone(&stats));
 
         let (tx_a, mut rx_a) = subscriber();
         let (tx_b, mut rx_b) = subscriber();
         clients.add(tx_a);
         clients.add(tx_b);
+        assert_eq!(stats.snapshot().clients, 2);
 
         clients.broadcast(&sample(42.0));
         assert_eq!(rx_a.try_recv().map(|r| wattage(&r)), Ok(Some(42.0)));
         assert_eq!(rx_b.try_recv().map(|r| wattage(&r)), Ok(Some(42.0)));
     }
 
-    /// One client hanging up must not cost the others a sample.
+    /// One client hanging up must not cost the others a sample, and must not
+    /// leave the reported count overstated either.
     #[test]
     fn a_departure_does_not_disturb_the_rest() {
-        let mut clients = Clients::new();
+        let stats = test_stats();
+        let mut clients = Clients::new(Arc::clone(&stats));
 
         let (tx_gone, rx_gone) = subscriber();
         let (tx_stays, mut rx_stays) = subscriber();
@@ -775,13 +835,14 @@ mod tests {
 
         assert_eq!(rx_stays.try_recv().map(|r| wattage(&r)), Ok(Some(1.0)));
         assert_eq!(rx_stays.try_recv().map(|r| wattage(&r)), Ok(Some(2.0)));
-        clients.reap();
+        assert_eq!(stats.snapshot().clients, 1);
         assert!(!clients.is_empty());
     }
 
     #[test]
     fn a_failure_is_reported_to_everyone() {
-        let mut clients = Clients::new();
+        let stats = test_stats();
+        let mut clients = Clients::new(Arc::clone(&stats));
         let (tx_a, mut rx_a) = subscriber();
         let (tx_b, mut rx_b) = subscriber();
         clients.add(tx_a);
@@ -796,13 +857,15 @@ mod tests {
             ));
         }
         assert!(clients.is_empty());
+        assert_eq!(stats.snapshot().clients, 0);
     }
 
     /// A closed socket reads as a protocol error at the far end, so shutdown
     /// owes every client an explicit end.
     #[test]
     fn shutdown_ends_every_stream() {
-        let mut clients = Clients::new();
+        let stats = test_stats();
+        let mut clients = Clients::new(Arc::clone(&stats));
         let (tx_a, mut rx_a) = subscriber();
         let (tx_b, mut rx_b) = subscriber();
         clients.add(tx_a);
@@ -813,6 +876,58 @@ mod tests {
         assert!(matches!(rx_a.try_recv(), Ok(Response::StreamEnd)));
         assert!(matches!(rx_b.try_recv(), Ok(Response::StreamEnd)));
         assert!(clients.is_empty());
+        assert_eq!(stats.snapshot().clients, 0);
+    }
+
+    /// `agent status` reads its answer from the shared counters, which is what
+    /// lets the connection handler reply while the actor is busy on the link.
+    #[test]
+    fn a_ping_carries_the_address_and_status() {
+        let addr: BDAddr = "CB:DF:6B:12:34:56".parse().unwrap();
+        let stats = test_stats();
+        stats.set_clients(2);
+        let info = AgentInfo {
+            addr,
+            stats: Arc::clone(&stats),
+        };
+
+        let Some(Response::Pong {
+            addr: reported,
+            status: Some(status),
+        }) = control_response(&Request::Ping, false, &info)
+        else {
+            panic!("a ping must be answered with a pong carrying a status");
+        };
+        assert_eq!(reported, Some(addr.to_string()));
+        assert_eq!(status.clients, 2);
+        assert!(!status.connected, "no link has been established yet");
+
+        // With the actor gone there is nothing to report about, so the ping
+        // becomes an error rather than a pong that looks healthy.
+        assert!(matches!(
+            control_response(&Request::Ping, true, &info),
+            Some(Response::Error { .. })
+        ));
+    }
+
+    /// Streaming and one-shot requests are the actor's work; these two are not,
+    /// which is what keeps `agent status` and `agent stop` answerable.
+    #[test]
+    fn only_ping_and_shutdown_are_answered_without_the_actor() {
+        let info = AgentInfo {
+            addr: "CB:DF:6B:12:34:56".parse().unwrap(),
+            stats: test_stats(),
+        };
+        assert!(matches!(
+            control_response(&Request::Shutdown, false, &info),
+            Some(Response::Ok)
+        ));
+        for request in [Request::Subscribe, Request::GetRtc, Request::TestLed] {
+            assert!(
+                control_response(&request, false, &info).is_none(),
+                "{request:?} is the actor's to serve"
+            );
+        }
     }
 
     fn mode_of(path: &Path) -> u32 {

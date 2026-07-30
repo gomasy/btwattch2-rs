@@ -14,6 +14,30 @@ pub enum Request {
     Shutdown,
 }
 
+/// What the agent reports about itself on a ping, for `agent status`.
+///
+/// Every field is defaulted, so a reply from an agent too old to send them
+/// parses as a status with nothing to say rather than failing outright — the
+/// same tolerance `addr` gets on `Pong`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentStatus {
+    /// How long the agent has been serving.
+    pub uptime_seconds: u64,
+    /// The polling period it was started with.
+    pub interval_seconds: f64,
+    /// Whether it currently believes the BLE link is up. A running agent with a
+    /// dead link is the state this exists to make visible.
+    pub connected: bool,
+    /// Measurements read since start, and how long ago the last one arrived.
+    pub samples: u64,
+    pub last_sample_age_seconds: Option<f64>,
+    /// Links re-established since start.
+    pub reconnects: u64,
+    /// Clients currently streaming.
+    pub clients: usize,
+}
+
 /// Cloneable so one measurement can be handed to every streaming client without
 /// re-deriving it per client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +49,8 @@ pub enum Response {
         /// an agent that predates the field still parses, as `None`.
         #[serde(default)]
         addr: Option<String>,
+        #[serde(default)]
+        status: Option<AgentStatus>,
     },
     Error {
         message: String,
@@ -112,7 +138,10 @@ mod tests {
     fn other_responses_are_not_measurements() {
         for resp in [
             Response::Ok,
-            Response::Pong { addr: None },
+            Response::Pong {
+                addr: None,
+                status: None,
+            },
             Response::StreamEnd,
             Response::CommandResult { code: 0 },
         ] {
@@ -120,11 +149,36 @@ mod tests {
         }
     }
 
-    /// A pong from an agent that predates the `addr` field must still parse.
+    /// A pong from an agent that predates the `addr` and `status` fields must
+    /// still parse, rather than making the agent look absent.
     #[test]
-    fn pong_without_an_address_parses() {
+    fn pong_without_an_address_or_status_parses() {
         let resp: Response = serde_json::from_str(r#"{"type":"pong"}"#).unwrap();
-        assert!(matches!(resp, Response::Pong { addr: None }));
+        assert!(matches!(
+            resp,
+            Response::Pong {
+                addr: None,
+                status: None
+            }
+        ));
+    }
+
+    /// Likewise for a status that gained fields since the peer was built: what
+    /// it does send survives, and the rest defaults.
+    #[test]
+    fn a_partial_status_parses() {
+        let resp: Response =
+            serde_json::from_str(r#"{"type":"pong","status":{"samples":7}}"#).unwrap();
+        let Response::Pong {
+            status: Some(status),
+            ..
+        } = resp
+        else {
+            panic!("expected a pong carrying a status");
+        };
+        assert_eq!(status.samples, 7);
+        assert_eq!(status.reconnects, 0);
+        assert_eq!(status.last_sample_age_seconds, None);
     }
 
     #[test]

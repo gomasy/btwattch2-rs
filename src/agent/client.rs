@@ -2,7 +2,6 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use btleplug::api::BDAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -59,18 +58,21 @@ pub async fn request(request: &Request, paths: &super::AgentPaths) -> Result<Res
     response.context("agent returned no response")
 }
 
-/// Ping the agent, returning the device it reports being attached to. `None`
-/// means the agent answered but did not name one.
-pub async fn ping(paths: &super::AgentPaths) -> Result<Option<BDAddr>> {
+/// Ping the agent, returning what it reports about itself. A `None` address or
+/// status means the agent answered but did not send that field.
+pub async fn ping(paths: &super::AgentPaths) -> Result<super::DaemonInfo> {
     let response = tokio::time::timeout(Duration::from_millis(500), request(&Request::Ping, paths))
         .await
         .map_err(|_| anyhow::anyhow!("agent ping timed out"))??;
     match response {
-        Response::Pong { addr } => addr
-            .as_deref()
-            .map(str::parse)
-            .transpose()
-            .context("agent reported an unparsable address"),
+        Response::Pong { addr, status } => Ok(super::DaemonInfo {
+            addr: addr
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .context("agent reported an unparsable address")?,
+            status,
+        }),
         _ => bail!("agent returned an unexpected ping response"),
     }
 }
@@ -93,6 +95,7 @@ async fn connect(paths: &super::AgentPaths) -> Result<UnixStream> {
 mod tests {
     use tokio::net::UnixListener;
 
+    use super::super::protocol::AgentStatus;
     use super::super::testutil::TempPath;
     use super::*;
 
@@ -106,7 +109,7 @@ mod tests {
         )
     }
 
-    async fn run_ping_test(response: Option<Response>) -> Result<Option<BDAddr>> {
+    async fn run_ping_test(response: Option<Response>) -> Result<super::super::DaemonInfo> {
         let (paths, _temp) = test_paths();
         let listener = UnixListener::bind(&paths.socket)?;
         let server = tokio::spawn(async move {
@@ -130,30 +133,34 @@ mod tests {
 
     #[tokio::test]
     async fn ping_requires_pong() {
-        assert!(
-            run_ping_test(Some(Response::Pong { addr: None }))
-                .await
-                .is_ok()
-        );
+        let pong = Response::Pong {
+            addr: None,
+            status: None,
+        };
+        assert!(run_ping_test(Some(pong)).await.is_ok());
         assert!(run_ping_test(Some(Response::Ok)).await.is_err());
     }
 
     #[tokio::test]
-    async fn ping_reports_the_agent_address() {
+    async fn ping_reports_the_agent_address_and_status() {
         let addr = "CB:DF:6B:12:34:56";
         let response = Response::Pong {
             addr: Some(addr.to_string()),
+            status: Some(AgentStatus {
+                samples: 42,
+                ..AgentStatus::default()
+            }),
         };
-        assert_eq!(
-            run_ping_test(Some(response)).await.unwrap(),
-            Some(addr.parse().unwrap())
-        );
+        let info = run_ping_test(Some(response)).await.unwrap();
+        assert_eq!(info.addr, Some(addr.parse().unwrap()));
+        assert_eq!(info.status.unwrap().samples, 42);
     }
 
     #[tokio::test]
     async fn ping_rejects_an_unparsable_address() {
         let response = Response::Pong {
             addr: Some("not-an-address".to_string()),
+            status: None,
         };
         assert!(run_ping_test(Some(response)).await.is_err());
     }
@@ -174,7 +181,9 @@ mod tests {
             stream.write_all(b"{\"type\":\"pong\"}\n").await.ok();
         });
 
-        assert_eq!(ping(&paths).await.unwrap(), None);
+        let info = ping(&paths).await.unwrap();
+        assert_eq!(info.addr, None);
+        assert!(info.status.is_none());
     }
 
     #[tokio::test]

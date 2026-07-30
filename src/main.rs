@@ -156,6 +156,9 @@ async fn run_agent_command(
                 if let Some(addr) = daemon.addr {
                     println!("Attached to: {addr}");
                 }
+                if let Some(status) = &daemon.status {
+                    print_agent_status(status);
+                }
             } else {
                 // Name the socket: with a profile per device there are several
                 // an invocation could have meant, and which one was checked is
@@ -211,6 +214,50 @@ async fn run_via_daemon(
 
             until_deadline(work, cli.duration).await
         }
+    }
+}
+
+/// Report what the agent says about itself. Printed only when the agent sent a
+/// status at all, so an older daemon still gets its pid and address reported.
+fn print_agent_status(status: &agent::protocol::AgentStatus) {
+    let link = if status.connected {
+        "connected"
+    } else {
+        // A running agent whose link has dropped is the state worth naming: it
+        // answers commands, and every one of them will fail until it recovers.
+        "disconnected"
+    };
+    println!("Link:        {link}");
+    println!("Interval:    {}", format_seconds(status.interval_seconds));
+    println!("Uptime:      {}", format_duration(status.uptime_seconds));
+    match status.last_sample_age_seconds {
+        Some(age) => println!(
+            "Samples:     {} (last {} ago)",
+            status.samples,
+            format_seconds(age)
+        ),
+        None => println!("Samples:     {} (none yet)", status.samples),
+    }
+    println!("Reconnects:  {}", status.reconnects);
+    println!("Clients:     {}", status.clients);
+}
+
+/// A duration in seconds, in the spelling `--interval` accepts — the same
+/// rendering `Interval` itself uses, which is `Duration`'s. Rounded to
+/// milliseconds first, so a float a hair off a round number does not come out as
+/// `899.999999ms`.
+fn format_seconds(seconds: f64) -> String {
+    let millis = (seconds * 1000.0).round().max(0.0) as u64;
+    format!("{:?}", Duration::from_millis(millis))
+}
+
+/// An uptime as `3h 12m 4s`, dropping the units that would read as zero.
+fn format_duration(seconds: u64) -> String {
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    match (h, m) {
+        (0, 0) => format!("{s}s"),
+        (0, _) => format!("{m}m {s}s"),
+        _ => format!("{h}h {m}m {s}s"),
     }
 }
 
@@ -294,5 +341,37 @@ fn print_scan(devices: &[ScannedDevice], mode: ScanMode) {
     let hidden = devices.len() - listed.len();
     if hidden > 0 && connection::info_enabled() {
         eprintln!("[INFO] {hidden} other device(s) hidden; use --scan-all to list them");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Status output is meant to be pasteable back into `--interval`.
+    #[test]
+    fn seconds_are_spelled_the_way_the_flag_accepts() {
+        for (seconds, expected) in [
+            (1.0, "1s"),
+            (2.0, "2s"),
+            (1.5, "1.5s"),
+            (0.5, "500ms"),
+            (0.9, "900ms"),
+            (0.01, "10ms"),
+        ] {
+            assert_eq!(format_seconds(seconds), expected, "formatting {seconds}");
+        }
+    }
+
+    #[test]
+    fn an_uptime_drops_the_units_that_read_as_zero() {
+        for (seconds, expected) in [
+            (4, "4s"),
+            (64, "1m 4s"),
+            (3600, "1h 0m 0s"),
+            (11524, "3h 12m 4s"),
+        ] {
+            assert_eq!(format_duration(seconds), expected, "formatting {seconds}");
+        }
     }
 }
