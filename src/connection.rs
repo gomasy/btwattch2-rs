@@ -66,7 +66,7 @@ macro_rules! info {
     };
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Measurement {
     pub voltage: f64,
     pub ampere: f64,

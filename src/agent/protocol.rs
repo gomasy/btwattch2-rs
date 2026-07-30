@@ -36,6 +36,8 @@ pub struct AgentStatus {
     pub reconnects: u64,
     /// Clients currently streaming.
     pub clients: usize,
+    /// Where the metrics endpoint is bound, if it is serving.
+    pub metrics_listen: Option<String>,
 }
 
 /// Cloneable so one measurement can be handed to every streaming client without

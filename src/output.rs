@@ -42,6 +42,51 @@ fn field_names() -> impl Iterator<Item = &'static str> {
         .chain([ENERGY_NAME])
 }
 
+/// The exposition body the agent's `/metrics` endpoint serves.
+///
+/// Deliberately not the same bytes as `--format prometheus`: that renders one
+/// sample per line as it streams, timestamp included, for a textfile collector.
+/// A scraped endpoint reports the *current* reading, so it carries no per-sample
+/// timestamp — a scraper stamps what it reads, and a stale sample is better
+/// described by `up 0` than by a backdated one it may refuse outright. The
+/// channel list, names, and help strings are the same either way.
+///
+/// `sample` is the latest measurement, `up` whether it is fresh enough to stand
+/// for the device's present state. When it is not, the channels are omitted
+/// rather than repeated: a gauge that keeps returning the last value it saw
+/// makes a dead link look like a steady load.
+pub fn metrics_exposition(prefix: &str, sample: Option<&Measurement>, up: bool) -> String {
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, value: &dyn std::fmt::Display| {
+        // Infallible: the only error a `fmt::Write` into a String can report is
+        // one the formatter itself raises, and none of these do.
+        use std::fmt::Write;
+        let _ = write!(
+            out,
+            "# HELP {prefix}_{name} {help}\n# TYPE {prefix}_{name} gauge\n{prefix}_{name} {value}\n"
+        );
+    };
+
+    if let Some(m) = sample.filter(|_| up) {
+        for (name, help, value) in CHANNELS {
+            gauge(name, help, &value(m));
+        }
+    }
+    if let Some(m) = sample {
+        gauge(
+            "last_sample_timestamp_seconds",
+            "Device clock of the most recent measurement",
+            &m.timestamp.timestamp(),
+        );
+    }
+    gauge(
+        "up",
+        "Whether the agent currently has fresh measurements from the device",
+        &u8::from(up),
+    );
+    out
+}
+
 /// One JSON Lines record. Serialized through serde, which gets the escaping and
 /// the `null` for a non-finite float that a formatted string would not, but
 /// written entry by entry: a `Value` or `json!` map sorts keys alphabetically
@@ -290,7 +335,7 @@ impl Default for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::testutil::measurement;
+    use crate::connection::testutil::{EPOCH, measurement};
 
     fn json_line(m: &Measurement, energy_wh: f64) -> String {
         serde_json::to_string(&JsonLine {
@@ -329,6 +374,43 @@ mod tests {
         let json = json_line(&measurement(f64::NAN), f64::INFINITY);
         assert!(json.contains("\"wattage\":null"), "{json}");
         assert!(json.contains("\"energy_wh\":null"), "{json}");
+    }
+
+    #[test]
+    fn exposition_carries_every_channel_and_up() {
+        let body = metrics_exposition("btwattch2", Some(&measurement(2.0)), true);
+        for (name, _, _) in CHANNELS {
+            assert!(
+                body.contains(&format!("# TYPE btwattch2_{name} gauge\n")),
+                "{name} missing from:\n{body}"
+            );
+        }
+        assert!(body.contains("btwattch2_wattage 2\n"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "btwattch2_last_sample_timestamp_seconds {EPOCH}\n"
+            )),
+            "{body}"
+        );
+        assert!(body.ends_with("btwattch2_up 1\n"), "{body}");
+        // A scraped endpoint leaves the timestamp to the scraper.
+        assert!(!body.contains(&format!("{}", EPOCH * 1000)), "{body}");
+    }
+
+    /// A stale or absent reading must not be served as a live gauge value.
+    #[test]
+    fn exposition_omits_channels_when_down() {
+        for sample in [Some(&measurement(2.0)), None] {
+            let body = metrics_exposition("btwattch2", sample, false);
+            assert!(!body.contains("btwattch2_wattage"), "{body}");
+            assert!(body.contains("btwattch2_up 0\n"), "{body}");
+        }
+        // The age of the last reading stays visible even when it is stale.
+        let body = metrics_exposition("btwattch2", Some(&measurement(2.0)), false);
+        assert!(
+            body.contains("btwattch2_last_sample_timestamp_seconds"),
+            "{body}"
+        );
     }
 
     #[test]

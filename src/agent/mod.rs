@@ -1,4 +1,5 @@
 pub mod client;
+pub mod metrics;
 pub mod protocol;
 pub mod server;
 pub mod status;

@@ -15,11 +15,18 @@ use tokio::sync::{Notify, mpsc};
 
 use super::protocol::{Request, Response};
 use super::status::AgentStats;
-use crate::cli::ConnectionConfig;
+use crate::cli::{ConnectionConfig, Settings};
 use crate::connection::{
     self, COMMAND_TIMEOUT, Connection, FrameAssembler, FrameKind, Notifications,
 };
 use crate::payload;
+
+/// What the connection handlers need to answer a request without troubling the
+/// actor: which device this agent holds, and its live counters.
+struct AgentInfo {
+    addr: BDAddr,
+    stats: Arc<AgentStats>,
+}
 
 struct ActorCommand {
     request: Request,
@@ -30,13 +37,6 @@ struct ActorCommand {
 /// path below — an early `?`, a signal during the initial connect, `agent stop`
 /// — has to take both files with it, and a guard is the only way to say that
 /// once rather than at each `return`. Removal only; whether the agent stopped
-/// What the connection handlers need to answer a request without troubling the
-/// actor: which device this agent holds, and its live counters.
-struct AgentInfo {
-    addr: BDAddr,
-    stats: Arc<AgentStats>,
-}
-
 /// cleanly or never got going is `run`'s to report, not a destructor's.
 struct AgentFiles<'a>(&'a super::AgentPaths);
 
@@ -46,7 +46,11 @@ impl Drop for AgentFiles<'_> {
     }
 }
 
-pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result<()> {
+pub async fn run(
+    config: &ConnectionConfig,
+    settings: &Settings,
+    paths: &super::AgentPaths,
+) -> Result<()> {
     let sock = &paths.socket;
 
     // Register before creating anything, so no window exists where a signal
@@ -64,7 +68,17 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
 
-    let stats = Arc::new(AgentStats::new(config.interval));
+    // Claimed before the connect: a port already in use should fail now rather
+    // than after the tens of seconds a BLE connect can take.
+    let metrics = match settings.metrics_listen {
+        Some(addr) => {
+            let listener = super::metrics::bind(addr).await?;
+            eprintln!("[INFO] Metrics endpoint listening on http://{addr}/metrics");
+            Some(listener)
+        }
+        None => None,
+    };
+    let stats = Arc::new(AgentStats::new(config.interval, settings.metrics_listen));
 
     // Connecting can take tens of seconds of scanning and retries. Watch for a
     // signal throughout, so a Ctrl-C here runs the cleanup above instead of
@@ -78,9 +92,17 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     };
 
     // The link is up before anything has been read from it, so record it here:
-    // otherwise an agent sitting idle with a healthy connection would report
-    // itself as disconnected until the first measurement.
+    // otherwise an agent sitting idle with a healthy connection — nobody
+    // streaming, no endpoint polling — would report itself as disconnected until
+    // the first measurement.
     stats.set_connected(true);
+
+    // The endpoint has something to serve now. Started here
+    // rather than at bind time so a scrape landing during the connect is
+    // refused outright instead of being answered with `up 0` from an agent that
+    // has not finished starting.
+    let metrics_task =
+        metrics.map(|listener| tokio::spawn(super::metrics::serve(listener, Arc::clone(&stats))));
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
     // Two separate signals rather than one: the accept loop must stop first so
@@ -94,8 +116,18 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
         addr: config.addr,
         stats: Arc::clone(&stats),
     });
+    // A serving endpoint keeps the device polled even with no client attached:
+    // an exporter that only sampled while someone watched would serve nothing to
+    // the scraper it exists for.
+    let poll_always = metrics_task.is_some();
 
-    let mut actor = tokio::spawn(actor_loop(conn, cmd_rx, actor_shutdown.clone(), stats));
+    let mut actor = tokio::spawn(actor_loop(
+        conn,
+        cmd_rx,
+        actor_shutdown.clone(),
+        stats,
+        poll_always,
+    ));
     let result = tokio::select! {
         result = accept_loop(listener, cmd_tx.clone(), shutdown, info, signals) => result,
         actor_result = &mut actor => {
@@ -107,6 +139,9 @@ pub async fn run(config: &ConnectionConfig, paths: &super::AgentPaths) -> Result
     actor_shutdown.notify_one();
     drop(cmd_tx);
     actor.await.ok();
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
     // Reached only after the agent actually served, so a startup failure no
     // longer reports a clean stop on its way out.
     eprintln!("[INFO] Agent stopped");
@@ -447,6 +482,8 @@ struct Actor {
     clients: Clients,
     monitoring_payload: Vec<u8>,
     stats: Arc<AgentStats>,
+    /// Keep polling even with no client attached, for the metrics endpoint.
+    poll_always: bool,
 }
 
 async fn actor_loop(
@@ -454,14 +491,18 @@ async fn actor_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<ActorCommand>,
     shutdown: Arc<Notify>,
     stats: Arc<AgentStats>,
+    poll_always: bool,
 ) {
-    let mut actor = Actor::new(conn, stats);
+    // With the endpoint serving, nothing will ever ask for a subscription, so
+    // the actor polls on its own from the first tick — which `interval` fires
+    // straight away, and which takes the subscription out itself.
+    let mut actor = Actor::new(conn, stats, poll_always);
 
     loop {
         let event = tokio::select! {
             _ = shutdown.notified() => break,
             cmd = cmd_rx.recv() => Event::Command(cmd),
-            _ = actor.ticker.tick(), if !actor.clients.is_empty() => Event::Tick,
+            _ = actor.ticker.tick(), if actor.wants_poll() => Event::Tick,
             event = next_notification(&mut actor.notifications) => Event::Notification(event),
         };
 
@@ -505,8 +546,14 @@ async fn next_notification(notifications: &mut Option<Notifications>) -> Option<
 }
 
 impl Actor {
-    fn new(conn: Connection, stats: Arc<AgentStats>) -> Self {
-        let ticker = tokio::time::interval(conn.interval());
+    fn new(conn: Connection, stats: Arc<AgentStats>, poll_always: bool) -> Self {
+        let mut ticker = tokio::time::interval(conn.interval());
+        // A poll that overruns its period — a write that retries through a
+        // reconnect, say — must not leave a backlog of ticks to fire
+        // back-to-back afterwards. That matters more now the agent polls
+        // unattended for the metrics endpoint: the default burst behaviour would
+        // answer a minute of failed writes with a minute of instant retries.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self {
             conn,
             notifications: None,
@@ -515,7 +562,14 @@ impl Actor {
             clients: Clients::new(Arc::clone(&stats)),
             monitoring_payload: payload::monitoring(),
             stats,
+            poll_always,
         }
+    }
+
+    /// Whether the device should be polled: somebody is streaming, or the
+    /// metrics endpoint needs a current reading to serve.
+    fn wants_poll(&self) -> bool {
+        self.poll_always || !self.clients.is_empty()
     }
 
     /// Adopt a fresh notification stream, discarding any half-assembled frame.
@@ -548,10 +602,20 @@ impl Actor {
         self.clients.abort(&reason);
     }
 
-    /// Ask the device for a measurement. Only runs while a client is streaming.
+    /// Ask the device for a measurement. Only runs while something wants one.
     async fn poll_device(&mut self) {
         self.clients.reap();
-        if self.clients.is_empty() {
+        if !self.wants_poll() {
+            return;
+        }
+
+        // An aborted stream leaves no subscription behind. Nobody else will take
+        // one out when the endpoint is what keeps the polling going, so recover
+        // here rather than waiting for a client that may never arrive.
+        if self.notifications.is_none()
+            && let Err(e) = self.relisten().await
+        {
+            eprintln!("[ERR] {e}");
             return;
         }
 
@@ -596,7 +660,9 @@ impl Actor {
             let Some(m) = connection::try_measurement(&frame) else {
                 continue;
             };
-            stats.record_sample();
+            // Recorded even with no client attached: this is what the metrics
+            // endpoint serves, and what `agent status` counts.
+            stats.record_sample(&m);
             clients.broadcast(&Response::from_measurement(&m));
         }
     }
@@ -612,7 +678,7 @@ impl Actor {
 
             Request::Subscribe => {
                 // Whether anything was being polled before this client arrived.
-                let idle = self.clients.is_empty();
+                let idle = !self.wants_poll();
                 // A subscription already in place is reused: taking out another
                 // would discard a part-received frame and cost the clients
                 // already streaming a sample.
@@ -734,7 +800,7 @@ impl Actor {
 
         let wait = connection::next_matching_frame(notifications, assembler, &kind, |frame| {
             if let Some(m) = connection::try_measurement(frame) {
-                stats.record_sample();
+                stats.record_sample(&m);
                 // A hung-up client is reaped on the next request; here the
                 // command reply is what matters.
                 clients.broadcast(&Response::from_measurement(&m));
@@ -775,7 +841,7 @@ mod tests {
     use super::*;
 
     fn test_stats() -> Arc<AgentStats> {
-        Arc::new(AgentStats::new("1s".parse().unwrap()))
+        Arc::new(AgentStats::new("1s".parse().unwrap(), None))
     }
 
     /// A subscriber and the receiving end it would be streaming to.

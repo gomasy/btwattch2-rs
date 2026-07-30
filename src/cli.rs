@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -154,7 +155,7 @@ impl ConnectOpts {
 }
 
 /// Everything one device needs: how to reach it, and where the agent holding it
-/// keeps its socket.
+/// keeps its socket and metrics endpoint.
 ///
 /// One type for three roles, because they have the same shape and the same
 /// merge rule: a `[devices.*]` section, the config file's own top-level keys,
@@ -164,6 +165,7 @@ impl ConnectOpts {
 pub struct Settings {
     pub connect: ConnectOpts,
     pub socket: Option<PathBuf>,
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 impl Settings {
@@ -174,6 +176,7 @@ impl Settings {
         Settings {
             connect: self.connect.or(&fallback.connect),
             socket: self.socket.clone().or_else(|| fallback.socket.clone()),
+            metrics_listen: self.metrics_listen.or(fallback.metrics_listen),
         }
     }
 }
@@ -330,7 +333,14 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum AgentAction {
     /// Start the agent daemon (runs in the foreground).
-    Start,
+    Start {
+        /// Serve Prometheus metrics over HTTP on this address, e.g.
+        /// 127.0.0.1:9101. The endpoint is unauthenticated, so bind it to a
+        /// loopback address unless something in front of it provides access
+        /// control.
+        #[arg(long, value_name = "addr")]
+        metrics_listen: Option<SocketAddr>,
+    },
     /// Stop a running agent daemon.
     Stop,
     /// Show agent daemon status.
@@ -376,7 +386,7 @@ impl Cli {
         matches!(
             self.command,
             Some(Command::Agent {
-                action: AgentAction::Start
+                action: AgentAction::Start { .. }
             })
         )
     }
@@ -461,6 +471,17 @@ impl Cli {
         }
     }
 
+    /// The metrics endpoint asked for on the command line. Only `agent start`
+    /// takes one: it is the daemon that would serve it.
+    fn metrics_listen_flag(&self) -> Option<SocketAddr> {
+        match &self.command {
+            Some(Command::Agent {
+                action: AgentAction::Start { metrics_listen },
+            }) => *metrics_listen,
+            _ => None,
+        }
+    }
+
     /// Resolve everything the invocation needs from the command line and the
     /// config file, the command line winning. Done once per run so the config
     /// file is read and validated a single time.
@@ -479,6 +500,7 @@ impl Cli {
         let cli = Settings {
             connect: self.connect.clone(),
             socket: self.socket.clone(),
+            metrics_listen: self.metrics_listen_flag(),
         };
         Ok(cli.or(&profile))
     }
@@ -652,6 +674,13 @@ fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result
             );
         }
         "socket" => profile.socket = Some(PathBuf::from(value)),
+        "metrics_listen" => {
+            profile.metrics_listen = Some(
+                value
+                    .parse()
+                    .with_context(|| format!("{place}: invalid metrics_listen: {value}"))?,
+            );
+        }
         _ => bail!("{place}: unknown key: {key}"),
     }
     Ok(())
@@ -739,24 +768,6 @@ mod tests {
         Cli::parse_from(std::iter::once("btwattch2").chain(args.iter().copied()))
     }
 
-    /// Parse `text` as the config file at a throwaway path.
-    fn config(text: &str) -> Result<FileConfig> {
-        parse_config(text, PathBuf::from("config.toml"))
-    }
-
-    /// Resolve `args` against `text` written to a real config file, which is the
-    /// only way through `settings` — it reads the file itself.
-    fn settings(args: &[&str], text: &str) -> Result<Settings> {
-        let temp = crate::agent::testutil::TempPath::new(".toml");
-        std::fs::write(temp.path(), text).unwrap();
-        let path = temp.path().to_str().unwrap().to_string();
-        let args: Vec<&str> = ["-c", &path]
-            .into_iter()
-            .chain(args.iter().copied())
-            .collect();
-        parse_cli(&args).settings()
-    }
-
     #[test]
     fn unquote_strips_one_pair_only() {
         assert_eq!(unquote("\"abc\""), "abc");
@@ -805,6 +816,24 @@ mod tests {
     fn other_formats_accept_a_dotted_prefix() {
         let cli = parse_cli(&["--metric-name", "a.b"]);
         assert!(cli.validate_prefix(&cli.mode()).is_ok());
+    }
+
+    /// Parse `text` as the config file at a throwaway path.
+    fn config(text: &str) -> Result<FileConfig> {
+        parse_config(text, PathBuf::from("config.toml"))
+    }
+
+    /// Resolve `args` against `text` written to a real config file, which is the
+    /// only way through `settings` — it reads the file itself.
+    fn settings(args: &[&str], text: &str) -> Result<Settings> {
+        let temp = crate::agent::testutil::TempPath::new(".toml");
+        std::fs::write(temp.path(), text).unwrap();
+        let path = temp.path().to_str().unwrap().to_string();
+        let args: Vec<&str> = ["-c", &path]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        parse_cli(&args).settings()
     }
 
     #[test]
@@ -983,7 +1012,8 @@ mod tests {
              [devices.rack]\n\
              addr = \"CB:DF:6B:AA:BB:CC\"\n\
              interval = 500ms\n\
-             socket = \"/run/btwattch2/rack.sock\"\n",
+             socket = \"/run/btwattch2/rack.sock\"\n\
+             metrics_listen = \"127.0.0.1:9101\"\n",
         )
         .unwrap();
 
@@ -996,6 +1026,7 @@ mod tests {
         let rack = cfg.profile(Some("rack")).unwrap();
         assert_eq!(rack.connect.interval, "500ms".parse().ok());
         assert_eq!(rack.socket, Some(PathBuf::from("/run/btwattch2/rack.sock")));
+        assert_eq!(rack.metrics_listen, "127.0.0.1:9101".parse().ok());
     }
 
     #[test]
@@ -1039,6 +1070,7 @@ mod tests {
             "[devices.]",
             "[devices.living]\nunknown = 1",
             "[devices.living]\ndefault = \"living\"",
+            "metrics_listen = \"not-an-address\"",
             "interval = 0",
             "addr = nonsense",
             "just a line",
@@ -1062,6 +1094,26 @@ mod tests {
         let overridden =
             settings(&["--device", "rack", "--socket", "/run/other.sock"], text).unwrap();
         assert_eq!(overridden.socket, Some(PathBuf::from("/run/other.sock")));
+    }
+
+    /// `--metrics-listen` only exists on `agent start`, and the profile's value
+    /// applies when the flag is absent.
+    #[test]
+    fn metrics_listen_comes_from_the_flag_or_the_profile() {
+        let text = "metrics_listen = \"127.0.0.1:9101\"\naddr = \"CB:DF:6B:12:34:56\"";
+        assert_eq!(
+            settings(&["agent", "start"], text).unwrap().metrics_listen,
+            "127.0.0.1:9101".parse().ok()
+        );
+        assert_eq!(
+            settings(
+                &["agent", "start", "--metrics-listen", "127.0.0.1:9999"],
+                text
+            )
+            .unwrap()
+            .metrics_listen,
+            "127.0.0.1:9999".parse().ok()
+        );
     }
 
     #[test]

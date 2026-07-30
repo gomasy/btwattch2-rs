@@ -207,11 +207,46 @@ Uptime:      3h 12m 4s
 Samples:     11524 (last 0.9s ago)
 Reconnects:  3
 Clients:     1
+Metrics:     http://127.0.0.1:9101/metrics
 ```
 
 `Link` is the state worth watching: an agent whose BLE link has dropped keeps answering commands, and every one of them fails until it recovers. `Reconnects` counts the links re-established since start — a number that keeps climbing points at range or interference rather than at the tool.
 
 The counters are read from shared state rather than from the connection actor, so `agent status` answers immediately even while the agent is blocked on the link — which is exactly when it is worth asking.
+
+#### Prometheus endpoint
+
+`agent start --metrics-listen <addr>` serves the latest measurement over HTTP at `/metrics`, so Prometheus can scrape the agent directly instead of going through a textfile collector:
+
+```console
+# btwattch2 --addr CB:DF:6B:12:34:56 agent start --metrics-listen 127.0.0.1:9101
+$ curl -s localhost:9101/metrics
+# HELP btwattch2_voltage Instantaneous voltage in volts
+# TYPE btwattch2_voltage gauge
+btwattch2_voltage 104.807
+...
+# TYPE btwattch2_last_sample_timestamp_seconds gauge
+btwattch2_last_sample_timestamp_seconds 1609304963
+# TYPE btwattch2_up gauge
+btwattch2_up 1
+```
+
+With the endpoint enabled the agent polls the device continuously, whether or not anything is streaming — otherwise there would be nothing current to serve. Scrape it like any other exporter:
+
+```yaml
+scrape_configs:
+  - job_name: btwattch2
+    static_configs:
+      - targets: ['127.0.0.1:9101']
+```
+
+Notes:
+
+- `btwattch2_up` is `0` when the last reading is too old to describe the device — no sample yet, or a link that dropped. The channel gauges are then omitted rather than repeated, since a gauge that keeps returning the last value it saw makes a dead link look like a steady load. The freshness window is three intervals, or five seconds, whichever is longer.
+- Unlike `--format prometheus`, the endpoint carries no per-sample timestamp: a scraper stamps what it reads, and a stale sample is better described by `up 0` than by a backdated one.
+- Session energy is not exposed. It is accumulated per run by the streaming client, so there is no meaningful value for a scrape to read.
+- The endpoint is plain HTTP with no authentication. Bind it to a loopback address unless something in front of it provides access control.
+- The metric names are fixed. Two agents scraped by one Prometheus are told apart by the target's own labels, not by renaming their metrics.
 
 The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
 
@@ -243,7 +278,7 @@ ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:
 
 The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM.
 
-> **Upgrading:** the socket protocol changed, so **restart the agent when you replace the binary**. A client and an agent from different versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected.
+> **Upgrading:** the socket protocol changed between 1.0 and 1.1, so **restart the agent when you replace the binary**. A client and an agent from those two versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected. Later additions to the protocol are backward compatible — a new client asking an older agent for its status simply gets the fields that agent knows about — but the agent still has to be restarted to serve the metrics endpoint or report the new status fields.
 
 ### Configuration file
 
@@ -256,7 +291,7 @@ index = 0
 interval = 1s
 ```
 
-Recognised keys are `addr`, `index`, `interval`, and `socket`. Unknown keys, malformed lines, and invalid values are errors rather than silently ignored, so a typo cannot leave you talking to the wrong device.
+Recognised keys are `addr`, `index`, `interval`, `socket`, and `metrics_listen`. Unknown keys, malformed lines, and invalid values are errors rather than silently ignored, so a typo cannot leave you talking to the wrong device.
 
 #### Device profiles
 
@@ -274,11 +309,13 @@ addr = "CB:DF:6B:12:34:56"
 addr = "CB:DF:6B:AA:BB:CC"
 interval = 500ms
 socket = "/run/btwattch2/rack.sock"
+metrics_listen = "127.0.0.1:9101"
 ```
 
 ```console
 # btwattch2 --off                     # the default profile: living
 # btwattch2 --device rack --off       # the rack meter, via its own socket
+# btwattch2 --device rack agent start  # serves metrics on 127.0.0.1:9101
 ```
 
 Because `socket` travels with the profile, `--device rack` reaches the agent holding that meter without repeating `--socket` on every command. A `--device` naming no section is an error listing the ones that exist.

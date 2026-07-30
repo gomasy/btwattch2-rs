@@ -126,11 +126,11 @@ async fn run_agent_command(
     paths: &agent::AgentPaths,
 ) -> Result<()> {
     match action {
-        AgentAction::Start => {
+        AgentAction::Start { .. } => {
             let conn_cfg = cli.connection_config(settings)?;
             let log_level = cli.log_level(false);
             connection::set_log_level(log_level);
-            agent::server::run(&conn_cfg, paths).await
+            agent::server::run(&conn_cfg, settings, paths).await
         }
         AgentAction::Stop => {
             if agent::probe_daemon(paths).await.is_none() {
@@ -240,6 +240,9 @@ fn print_agent_status(status: &agent::protocol::AgentStatus) {
     }
     println!("Reconnects:  {}", status.reconnects);
     println!("Clients:     {}", status.clients);
+    if let Some(addr) = &status.metrics_listen {
+        println!("Metrics:     http://{addr}/metrics");
+    }
 }
 
 /// A duration in seconds, in the spelling `--interval` accepts — the same
