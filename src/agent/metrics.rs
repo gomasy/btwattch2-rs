@@ -20,6 +20,8 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 /// The exposition format's content type, as scrapers expect it.
 const EXPOSITION_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+/// The content type of every other reply: the index and the error bodies.
+const TEXT_TYPE: &str = "text/plain; charset=utf-8";
 
 /// Claim the metrics port. Separate from `serve` so a port already in use fails
 /// `agent start` outright, rather than after the tens of seconds a BLE connect
@@ -90,7 +92,6 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
         return;
     }
 
-    const TEXT: &str = "text/plain; charset=utf-8";
     let response = match route(&line) {
         Some(Route::Metrics) => {
             let reading = stats.reading();
@@ -101,11 +102,16 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
             );
             response("200 OK", EXPOSITION_TYPE, "", &body)
         }
-        Some(Route::Index) => response("200 OK", TEXT, "", "btwattch2 agent\nmetrics: /metrics\n"),
+        Some(Route::Index) => response(
+            "200 OK",
+            TEXT_TYPE,
+            "",
+            "btwattch2 agent\nmetrics: /metrics\n",
+        ),
         Some(Route::MethodNotAllowed) => {
-            response("405 Method Not Allowed", TEXT, "Allow: GET\r\n", "")
+            response("405 Method Not Allowed", TEXT_TYPE, "Allow: GET\r\n", "")
         }
-        Some(Route::NotFound) | None => response("404 Not Found", TEXT, "", ""),
+        Some(Route::NotFound) | None => response("404 Not Found", TEXT_TYPE, "", ""),
     };
 
     // Drain the rest of the head before replying. A client still writing when

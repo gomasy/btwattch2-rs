@@ -373,9 +373,8 @@ async fn handle_client(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let line = match lines.next_line().await {
-        Ok(Some(line)) => line,
-        _ => return,
+    let Ok(Some(line)) = lines.next_line().await else {
+        return;
     };
 
     let request: Request = match serde_json::from_str(&line) {
