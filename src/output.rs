@@ -34,12 +34,17 @@ fn fields(m: &Measurement, energy_wh: f64) -> impl Iterator<Item = (&'static str
         .chain([(ENERGY_NAME, energy_wh)])
 }
 
-/// The same names without needing a measurement, for headers.
-fn field_names() -> impl Iterator<Item = &'static str> {
+/// The same fields as `(name, help)`, without needing a measurement: what the
+/// headers and metric declarations are built from.
+fn field_specs() -> impl Iterator<Item = (&'static str, &'static str)> {
     CHANNELS
         .iter()
-        .map(|(name, _, _)| *name)
-        .chain([ENERGY_NAME])
+        .map(|(name, help, _)| (*name, *help))
+        .chain([(ENERGY_NAME, ENERGY_HELP)])
+}
+
+fn field_names() -> impl Iterator<Item = &'static str> {
+    field_specs().map(|(name, _)| name)
 }
 
 /// The exposition body the agent's `/metrics` endpoint serves.
@@ -180,11 +185,7 @@ impl Printer {
             OutputFormat::Prometheus => {
                 let epoch_ms = m.timestamp.timestamp_millis();
                 if !self.header_printed {
-                    for (suffix, help) in CHANNELS
-                        .iter()
-                        .map(|(n, h, _)| (*n, *h))
-                        .chain([(ENERGY_NAME, ENERGY_HELP)])
-                    {
+                    for (suffix, help) in field_specs() {
                         println!("# HELP {}_{suffix} {help}", self.prefix);
                         println!("# TYPE {}_{suffix} gauge", self.prefix);
                     }
