@@ -53,6 +53,10 @@ impl FromStr for Interval {
     type Err = anyhow::Error;
 
     /// Accepts seconds (`1`, `0.5`, `2s`) or milliseconds (`500ms`).
+    ///
+    /// The message says what was wrong with the value, not what the value was:
+    /// both callers — clap and the config file parser — already name it, and
+    /// naming it again reads as a stutter.
     fn from_str(s: &str) -> Result<Self> {
         let text = s.trim();
         // `ms` first: `strip_suffix('s')` would otherwise leave a trailing `m`.
@@ -64,15 +68,14 @@ impl FromStr for Interval {
         let seconds: f64 = number
             .trim()
             .parse()
-            .map_err(|_| anyhow!("invalid interval {s:?}: expected 0.5, 500ms, or 2s"))?;
-        let duration = Duration::try_from_secs_f64(seconds * scale)
-            .map_err(|e| anyhow!("invalid interval {s:?}: {e}"))?;
+            .map_err(|_| anyhow!("expected a duration such as 0.5, 500ms, or 2s"))?;
+        let duration = Duration::try_from_secs_f64(seconds * scale)?;
 
         if duration < MIN_INTERVAL {
-            bail!("interval {s:?} is shorter than the {MIN_INTERVAL:?} minimum");
+            bail!("shorter than the {MIN_INTERVAL:?} minimum");
         }
         if duration > MAX_INTERVAL {
-            bail!("interval {s:?} is longer than the {MAX_INTERVAL:?} maximum");
+            bail!("longer than the {MAX_INTERVAL:?} maximum");
         }
         Ok(Self(duration))
     }
@@ -662,42 +665,34 @@ fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
 
 /// Apply one `key = value` pair to `profile`. Unknown keys are hard errors, so
 /// a typo cannot silently leave a default in place.
+///
+/// Every value is a `FromStr` that rejects what it cannot represent — `Interval`
+/// its own bounds, for one — so no key needs a range check here that could drift
+/// out of step with the type's.
 fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result<()> {
     match key {
-        "index" => {
-            profile.connect.index = Some(
-                value
-                    .parse()
-                    .with_context(|| format!("{place}: invalid index: {value}"))?,
-            );
-        }
-        // `Interval` rejects zero and anything below its floor as a parse
-        // error, so there is no separate range check to keep in step with clap's.
-        "interval" => {
-            profile.connect.interval = Some(
-                value
-                    .parse()
-                    .with_context(|| format!("{place}: invalid interval"))?,
-            );
-        }
-        "addr" => {
-            profile.connect.addr = Some(
-                value
-                    .parse()
-                    .map_err(|e| anyhow!("{place}: invalid addr {value}: {e}"))?,
-            );
-        }
+        "index" => profile.connect.index = Some(parse_value(value, key, place)?),
+        "interval" => profile.connect.interval = Some(parse_value(value, key, place)?),
+        "addr" => profile.connect.addr = Some(parse_value(value, key, place)?),
         "socket" => profile.socket = Some(PathBuf::from(value)),
-        "metrics_listen" => {
-            profile.metrics_listen = Some(
-                value
-                    .parse()
-                    .with_context(|| format!("{place}: invalid metrics_listen: {value}"))?,
-            );
-        }
+        "metrics_listen" => profile.metrics_listen = Some(parse_value(value, key, place)?),
         _ => bail!("{place}: unknown key: {key}"),
     }
     Ok(())
+}
+
+/// Parse one config value, naming the line, the key, and the value it choked
+/// on. One helper rather than a `with_context` per key, so every value in the
+/// file fails the same way — and so a message cannot go missing the line number
+/// that says which file and which line to go and look at.
+fn parse_value<T>(value: &str, key: &str, place: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|e| anyhow!("{place}: invalid {key} {value:?}: {e}"))
 }
 
 /// Strip one matching pair of double quotes, so `addr = "..."` and `addr = ...`
@@ -711,13 +706,11 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// Accept only metric names every supported backend can carry. Beyond the
-/// obviously broken, this keeps a name containing a newline or a tab from
+/// Accept only metric names every supported backend can carry: the union of
+/// what each accepts, which is `prometheus_char` plus `.` and `-` for
+/// Mackerel. `OutputFormat::validate_prefix` narrows it again per format.
+/// Rejecting the rest also keeps a name containing a newline or a tab from
 /// forging extra metric lines in the line-oriented formats.
-/// The union of what every supported backend accepts: `prometheus_char` plus
-/// `.` and `-` for Mackerel. `OutputFormat::validate_prefix` narrows it again
-/// per format. Rejecting the rest also keeps a name containing a newline or a
-/// tab from forging extra metric lines in the line-oriented formats.
 fn parse_metric_name(s: &str) -> Result<String> {
     let mut chars = s.chars();
     let head = chars
