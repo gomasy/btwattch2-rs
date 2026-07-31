@@ -62,7 +62,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         let window = cli
             .duration
             .map_or(DEFAULT_SCAN_WINDOW, Duration::from_secs);
-        let devices = Connection::scan(cli.adapter_index(&settings), window).await?;
+        let devices = Connection::scan(settings.adapter_index(), window).await?;
         print_scan(&devices, scan_mode);
         return Ok(());
     }
@@ -73,7 +73,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         return run_via_daemon(mode, &cli, log_level, &paths).await;
     }
 
-    let mut conn = Connection::new(&cli.connection_config(&settings)?).await?;
+    let mut conn = Connection::new(&settings.connection_config()?).await?;
 
     let result = tokio::select! {
         result = run(&mut conn, mode, &cli, log_level) => result,
@@ -127,7 +127,7 @@ async fn run_agent_command(
 ) -> Result<()> {
     match action {
         AgentAction::Start { .. } => {
-            let conn_cfg = cli.connection_config(settings)?;
+            let conn_cfg = settings.connection_config()?;
             let log_level = cli.log_level(false);
             connection::set_log_level(log_level);
             agent::server::run(&conn_cfg, settings, paths).await

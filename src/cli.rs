@@ -193,6 +193,24 @@ impl Settings {
             metrics_listen: self.metrics_listen.or(fallback.metrics_listen),
         }
     }
+
+    /// Adapter index to use. Shared by the scan path (which needs no address)
+    /// and `connection_config`.
+    pub fn adapter_index(&self) -> usize {
+        self.connect.index.unwrap_or(DEFAULT_INDEX)
+    }
+
+    /// Resolve the device address and other connection parameters. Fails when
+    /// no address is available.
+    pub fn connection_config(&self) -> Result<ConnectionConfig> {
+        Ok(ConnectionConfig {
+            index: self.adapter_index(),
+            interval: self.connect.interval.unwrap_or(DEFAULT_INTERVAL),
+            addr: self.connect.addr.ok_or_else(|| {
+                anyhow!("no device address given; pass --addr or set it in the config file")
+            })?,
+        })
+    }
 }
 
 /// Resolved connection parameters after merging the config file with the CLI.
@@ -519,24 +537,6 @@ impl Cli {
         Ok(cli.or(&profile))
     }
 
-    /// Adapter index to use. Shared by the scan path (which needs no address)
-    /// and `connection_config`.
-    pub fn adapter_index(&self, settings: &Settings) -> usize {
-        settings.connect.index.unwrap_or(DEFAULT_INDEX)
-    }
-
-    /// Resolve the device address and other connection parameters. Fails when
-    /// no address is available.
-    pub fn connection_config(&self, settings: &Settings) -> Result<ConnectionConfig> {
-        Ok(ConnectionConfig {
-            index: self.adapter_index(settings),
-            interval: settings.connect.interval.unwrap_or(DEFAULT_INTERVAL),
-            addr: settings.connect.addr.ok_or_else(|| {
-                anyhow!("no device address given; pass --addr or set it in the config file")
-            })?,
-        })
-    }
-
     /// Load a config file if one is requested or present at the default path.
     /// Malformed lines, unknown keys, and invalid values are hard errors so a
     /// typo can't silently fall back to defaults.
@@ -861,9 +861,7 @@ mod tests {
     fn cli_overlays_the_config_file() {
         let text = "index = 1\naddr = \"CB:DF:6B:12:34:56\"\ninterval = 9";
         let settings = settings(&["-n", "3"], text).unwrap();
-        let resolved = parse_cli(&["-n", "3"])
-            .connection_config(&settings)
-            .unwrap();
+        let resolved = settings.connection_config().unwrap();
         assert_eq!(resolved.interval, "3".parse().unwrap());
         assert_eq!(resolved.index, 1);
         assert_eq!(resolved.addr, "CB:DF:6B:12:34:56".parse().unwrap());
@@ -871,11 +869,7 @@ mod tests {
 
     #[test]
     fn connection_config_needs_an_address() {
-        assert!(
-            parse_cli(&[])
-                .connection_config(&Settings::default())
-                .is_err()
-        );
+        assert!(Settings::default().connection_config().is_err());
     }
 
     #[test]
@@ -887,7 +881,7 @@ mod tests {
             },
             ..Settings::default()
         };
-        let resolved = parse_cli(&[]).connection_config(&settings).unwrap();
+        let resolved = settings.connection_config().unwrap();
         assert_eq!(resolved.interval, DEFAULT_INTERVAL);
         assert_eq!(resolved.index, DEFAULT_INDEX);
     }
