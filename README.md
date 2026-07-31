@@ -9,7 +9,7 @@ This is a Rust port of [ruby-btwattch2](https://github.com/gomasy/ruby-btwattch2
 ## Requirements
 
 - Linux (BlueZ)
-- Rust (stable)
+- Rust 1.88+
 
 ## Build
 
@@ -34,6 +34,10 @@ Options:
                              e.g. 2s or 500ms [default: 1s]
   -c, --config <path>       Path to a config file (TOML-like `key = value`)
   --device <name>           Use the named [devices.<name>] section of the config file
+  --socket <path>           Path to the agent's unix socket
+                             [default: $XDG_RUNTIME_DIR/btwattch2.sock]
+  --pid-file <path>         Path to the agent's pid file
+                             [default: the socket path with a `.pid` extension]
   --on                      Turn on the power switch
   --off                     Turn off the power switch
   --set-rtc <time>          Specify the time to set to RTC
