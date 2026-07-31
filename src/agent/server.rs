@@ -2,7 +2,7 @@ use std::future::Future;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use tokio::sync::{Notify, mpsc};
 
 use super::protocol::{Request, Response};
 use super::status::AgentStats;
-use crate::cli::{ConnectionConfig, Settings};
+use crate::cli::{ConnectionConfig, Settings, SocketMode};
 use crate::connection::{
     self, COMMAND_TIMEOUT, Connection, FrameAssembler, FrameKind, Notifications,
 };
@@ -162,8 +162,7 @@ pub async fn run(
     // unlinked any leftover socket, so there is never one of someone else's for
     // this guard to remove.
     let files = AgentFiles::new(paths, pid_file);
-    let listener =
-        UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?;
+    let listener = bind_socket(sock, settings.socket_mode())?;
     files.write_pid()?;
 
     eprintln!("[INFO] Agent listening on {}", sock.display());
@@ -314,6 +313,55 @@ async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
     // and it is rewritten rather than removed.
     std::fs::remove_file(&paths.socket).ok();
     Ok(())
+}
+
+/// Bind the agent socket, and have it carry exactly `mode` from the moment it
+/// exists.
+///
+/// Both halves are needed. `bind` derives the mode from the umask, so a `chmod`
+/// on its own would leave a window — brief, but a window all the same — in which
+/// the socket is reachable at whatever the inherited umask happened to allow;
+/// narrowing the umask first closes it. The `chmod` is then what makes the mode
+/// exactly the one asked for rather than at most it, since a umask can only
+/// clear bits from whatever `bind` starts out with.
+///
+/// Note that reaching a socket also takes search permission on every directory
+/// above it. The default runtime directory is 0700, so widening the socket alone
+/// does not open it up — the directory has to allow it too, which is what
+/// `RuntimeDirectoryMode` or a pre-created directory is for.
+fn bind_socket(sock: &Path, mode: SocketMode) -> Result<UnixListener> {
+    let listener = {
+        let _umask = Umask::narrowed_to(mode);
+        UnixListener::bind(sock).with_context(|| format!("failed to bind {}", sock.display()))?
+    };
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(mode.bits()))
+        .with_context(|| format!("failed to set mode {mode} on {}", sock.display()))?;
+    Ok(listener)
+}
+
+/// The process umask, restored when the guard drops.
+///
+/// Process-wide, and so only safe to touch because agent startup is the one
+/// thing creating files at this point: the runtime directory and the pid file
+/// are already in place, and the tasks that could race with it are not spawned
+/// until the socket is bound.
+struct Umask(libc::mode_t);
+
+impl Umask {
+    /// Mask off every permission bit `mode` does not grant.
+    fn narrowed_to(mode: SocketMode) -> Self {
+        let mask = !(mode.bits() as libc::mode_t) & 0o777;
+        // SAFETY: `umask` cannot fail and touches nothing but this process's
+        // own mask, which the guard puts back.
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        // SAFETY: as above, restoring what the process started with.
+        unsafe { libc::umask(self.0) };
+    }
 }
 
 /// Create the socket's parent directory, private to us. The default runtime
@@ -943,8 +991,6 @@ fn reply(tx: &mpsc::Sender<Response>, result: Result<Response, StreamError>) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::super::testutil::TempPath;
     use super::*;
 
@@ -1146,6 +1192,7 @@ mod tests {
         let temp = TempPath::new(".pid");
         let paths = pid_paths(&temp);
 
+        let _guard = umask_guard();
         let claim = PidFile::claim(&paths).unwrap();
         claim.write(&paths.pid).unwrap();
 
@@ -1220,12 +1267,47 @@ mod tests {
         }
     }
 
+    /// A bind takes its mode from the umask, which an agent holding a mains
+    /// switch must not depend on. A configured mode is carried exactly as
+    /// written, since letting other users in is a choice the operator is
+    /// allowed to make — and it is never wider than that in between, which is
+    /// what binding under a narrowed umask buys.
+    #[tokio::test]
+    async fn the_socket_is_bound_at_the_configured_mode() {
+        for text in ["0600", "0660", "0666"] {
+            let mode: SocketMode = text.parse().unwrap();
+            let temp = TempPath::new(".sock");
+
+            let _guard = umask_guard();
+            let _listener = bind_socket(temp.path(), mode).unwrap();
+            assert_eq!(mode_of(temp.path()), mode.bits(), "binding at {text}");
+        }
+    }
+
+    /// A config file that says nothing about the socket gets owner-only.
+    #[tokio::test]
+    async fn the_default_socket_mode_admits_its_owner_alone() {
+        let temp = TempPath::new(".sock");
+
+        let _guard = umask_guard();
+        let _listener = bind_socket(temp.path(), Settings::default().socket_mode()).unwrap();
+        assert_eq!(mode_of(temp.path()), 0o600);
+    }
+
+    /// The umask a bind narrows is process-wide, so the tests that assert a mode
+    /// take turns rather than reading one another's window.
+    fn umask_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn socket_dir_is_created_private() {
         let temp = TempPath::new(".d");
         let sock = temp.path().join("deeper/a.sock");
         let dir = sock.parent().expect("socket path has a parent");
 
+        let _guard = umask_guard();
         ensure_socket_dir(&sock).unwrap();
         assert_eq!(mode_of(dir), 0o700);
 

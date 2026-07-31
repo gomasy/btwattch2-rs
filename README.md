@@ -282,6 +282,27 @@ RuntimeDirectoryMode=0700
 ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
 ```
 
+#### Socket permissions
+
+The socket and the pid file are created mode 0600 by default, so the agent's permissions do not depend on the umask it inherited — connecting to a unix socket takes write permission on it, and the agent holds a mains switch.
+
+To let other users reach the agent, set `socket_mode` in the config file to the mode you want, written as octal exactly as `chmod` takes it:
+
+```toml
+socket_mode = 0666
+```
+
+Only `agent start` acts on it; clients merely connect to the socket it created. Like `socket`, it can sit in a `[devices.<name>]` section so each agent gets its own. A value that is not octal permission bits is an error rather than a silent fall back to 0600, which would lock out the users it was set to admit.
+
+Note that reaching a socket also takes search permission on every directory above it, and the default runtime directory is 0700 — so widening the socket alone is not enough. Give the directory a matching mode as well, either through systemd or by creating it beforehand (an existing directory is left as it is):
+
+```ini
+[Service]
+RuntimeDirectory=btwattch2
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
+```
+
 The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM. While it runs it holds an exclusive lock on the pid file, so a second `agent start` on the same paths fails with `agent is already running (pid N)` rather than unlinking the first one's socket — including when the two are started at the same moment. The kernel releases the lock however the agent exits, so a pid file left behind by a crash never locks the agent out of starting again.
 
 > **Upgrading:** the socket protocol changed between 1.0 and 1.1, so **restart the agent when you replace the binary**. A client and an agent from those two versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected. Later additions to the protocol are backward compatible — a new client asking an older agent for its status simply gets the fields that agent knows about — but the agent still has to be restarted to serve the metrics endpoint or report the new status fields.
@@ -297,7 +318,7 @@ index = 0
 interval = 1s
 ```
 
-Recognised keys are `addr`, `index`, `interval`, `socket`, and `metrics_listen`. Unknown keys, malformed lines, and invalid values are errors rather than silently ignored, so a typo cannot leave you talking to the wrong device.
+Recognised keys are `addr`, `index`, `interval`, `socket`, `socket_mode`, and `metrics_listen`. Unknown keys, malformed lines, and invalid values are errors rather than silently ignored, so a typo cannot leave you talking to the wrong device.
 
 #### Device profiles
 
@@ -315,6 +336,7 @@ addr = "CB:DF:6B:12:34:56"
 addr = "CB:DF:6B:AA:BB:CC"
 interval = 500ms
 socket = "/run/btwattch2/rack.sock"
+socket_mode = 0660
 metrics_listen = "127.0.0.1:9101"
 ```
 

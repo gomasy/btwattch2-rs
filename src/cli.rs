@@ -13,6 +13,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 pub const DEFAULT_INDEX: usize = 0;
 pub const DEFAULT_INTERVAL: Interval = Interval(Duration::from_secs(1));
 
+/// The agent socket's mode when the config file does not set one: its owner
+/// alone, as the pid file beside it. `bind` would otherwise take its mode from
+/// the inherited umask, which is not something an agent that switches mains
+/// power should rest on — connecting to a unix socket takes write permission on
+/// it. Widen it with `socket_mode` when other users are meant to reach the agent.
+pub const DEFAULT_SOCKET_MODE: SocketMode = SocketMode(0o600);
+
 /// Shortest polling period accepted. The device answers a measurement request
 /// over BLE, and below a few milliseconds the requests only queue up behind
 /// replies that cannot arrive any faster — so the floor is a guard against a
@@ -91,6 +98,48 @@ impl fmt::Display for Interval {
 
 fn parse_interval(s: &str) -> Result<Interval> {
     s.parse()
+}
+
+/// The permission bits the agent creates its socket with.
+///
+/// A newtype rather than a bare `u32`, so "octal, and nothing beyond the
+/// permission bits" is settled at parse time — the same job `Interval` does for
+/// a duration. It also keeps the spelling octal in both directions, so a value
+/// read back reads as the one that was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketMode(u32);
+
+impl SocketMode {
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl FromStr for SocketMode {
+    type Err = anyhow::Error;
+
+    /// Always octal, with or without the customary leading zero. Never decimal:
+    /// `600` is how `chmod` and every mode anyone writes down is read, so taking
+    /// it as decimal would quietly apply something else entirely.
+    ///
+    /// As with `Interval`, the message describes what is wrong rather than
+    /// repeating the value its caller has already named.
+    fn from_str(s: &str) -> Result<Self> {
+        let bits = u32::from_str_radix(s.trim(), 8)
+            .map_err(|_| anyhow!("expected octal permission bits, e.g. 0600 or 0666"))?;
+        if bits > 0o777 {
+            bail!("sets bits beyond the 0o777 permission bits");
+        }
+        Ok(Self(bits))
+    }
+}
+
+/// Spelled as `chmod` would take it, so a reported mode can be pasted straight
+/// back into the config file.
+impl fmt::Display for SocketMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04o}", self.0)
+    }
 }
 
 /// How measurements are rendered to stdout.
@@ -182,6 +231,9 @@ impl ConnectOpts {
 pub struct Settings {
     pub connect: ConnectOpts,
     pub socket: Option<PathBuf>,
+    /// Permission bits for the socket the agent creates. Only `agent start`
+    /// acts on it; a client merely connects to a socket someone else made.
+    pub socket_mode: Option<SocketMode>,
     pub metrics_listen: Option<SocketAddr>,
 }
 
@@ -193,8 +245,14 @@ impl Settings {
         Settings {
             connect: self.connect.or(&fallback.connect),
             socket: self.socket.clone().or_else(|| fallback.socket.clone()),
+            socket_mode: self.socket_mode.or(fallback.socket_mode),
             metrics_listen: self.metrics_listen.or(fallback.metrics_listen),
         }
+    }
+
+    /// The mode the agent gives its socket, defaulting to owner-only.
+    pub fn socket_mode(&self) -> SocketMode {
+        self.socket_mode.unwrap_or(DEFAULT_SOCKET_MODE)
     }
 
     /// Adapter index to use. Shared by the scan path (which needs no address)
@@ -532,9 +590,12 @@ impl Cli {
             ),
         };
 
+        // No `socket_mode` here: it has no flag, so the file is the only place
+        // it can come from and there is nothing to overlay.
         let cli = Settings {
             connect: self.connect.clone(),
             socket: self.socket.clone(),
+            socket_mode: None,
             metrics_listen: self.metrics_listen_flag(),
         };
         Ok(cli.or(&profile))
@@ -667,14 +728,15 @@ fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
 /// a typo cannot silently leave a default in place.
 ///
 /// Every value is a `FromStr` that rejects what it cannot represent — `Interval`
-/// its own bounds, for one — so no key needs a range check here that could drift
-/// out of step with the type's.
+/// its bounds, `SocketMode` anything but permission bits — so no key needs a
+/// range check here that could drift out of step with the type's own.
 fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result<()> {
     match key {
         "index" => profile.connect.index = Some(parse_value(value, key, place)?),
         "interval" => profile.connect.interval = Some(parse_value(value, key, place)?),
         "addr" => profile.connect.addr = Some(parse_value(value, key, place)?),
         "socket" => profile.socket = Some(PathBuf::from(value)),
+        "socket_mode" => profile.socket_mode = Some(parse_value(value, key, place)?),
         "metrics_listen" => profile.metrics_listen = Some(parse_value(value, key, place)?),
         _ => bail!("{place}: unknown key: {key}"),
     }
@@ -1028,6 +1090,81 @@ mod tests {
         }
     }
 
+    /// Read the way `chmod` reads a mode, so what an operator writes down is
+    /// what lands on the socket.
+    #[test]
+    fn socket_mode_is_read_as_octal() {
+        for (text, expected) in [
+            ("0600", 0o600),
+            ("600", 0o600),
+            ("0666", 0o666),
+            ("666", 0o666),
+            ("0", 0),
+            ("777", 0o777),
+            (" 0660 ", 0o660),
+        ] {
+            let mode: SocketMode = text.parse().unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(mode.bits(), expected, "parsing {text:?}");
+        }
+    }
+
+    /// Rejected rather than defaulted: the key is set to widen access, so
+    /// falling back to owner-only would lock out the very users a typo was
+    /// meant to admit. `0o600` is Rust's spelling, not `chmod`'s.
+    #[test]
+    fn socket_mode_rejects_anything_that_is_not_permission_bits() {
+        for text in [
+            "",
+            "   ",
+            "rw-------",
+            "0999",
+            "0888",
+            "1000",
+            "-1",
+            "0o600",
+        ] {
+            assert!(text.parse::<SocketMode>().is_err(), "accepted {text:?}");
+        }
+    }
+
+    /// The rendering is what `FromStr` accepts, so a mode can be pasted back
+    /// into the config file.
+    #[test]
+    fn socket_mode_display_round_trips() {
+        for text in ["0600", "0660", "0666", "0777"] {
+            let parsed: SocketMode = text.parse().unwrap();
+            assert_eq!(parsed.to_string(), text);
+            assert_eq!(text.parse::<SocketMode>().unwrap(), parsed);
+        }
+    }
+
+    /// The socket mode travels with the profile like the socket path does, and
+    /// a file that says nothing about it leaves the owner-only default.
+    #[test]
+    fn socket_mode_comes_from_the_profile() {
+        let cfg = config(
+            "socket_mode = 0660\n\
+             [devices.living]\n\
+             addr = \"CB:DF:6B:12:34:56\"\n\
+             [devices.rack]\n\
+             addr = \"CB:DF:6B:AA:BB:CC\"\n\
+             socket_mode = \"0666\"\n",
+        )
+        .unwrap();
+
+        // Inherited from the top-level keys.
+        assert_eq!(
+            cfg.profile(Some("living")).unwrap().socket_mode(),
+            "0660".parse().unwrap()
+        );
+        // The section wins.
+        assert_eq!(
+            cfg.profile(Some("rack")).unwrap().socket_mode(),
+            "0666".parse().unwrap()
+        );
+        assert_eq!(Settings::default().socket_mode(), DEFAULT_SOCKET_MODE);
+    }
+
     #[test]
     fn a_file_without_sections_is_the_whole_configuration() {
         let cfg = config("addr = \"CB:DF:6B:12:34:56\"\ninterval = 500ms").unwrap();
@@ -1104,6 +1241,8 @@ mod tests {
             "[devices.living]\nunknown = 1",
             "[devices.living]\ndefault = \"living\"",
             "metrics_listen = \"not-an-address\"",
+            "socket_mode = 0999",
+            "socket_mode = rw-------",
             "interval = 0",
             "addr = nonsense",
             "just a line",
