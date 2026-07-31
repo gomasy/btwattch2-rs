@@ -145,13 +145,10 @@ async fn run_agent_command(
             if let Some(daemon) = agent::probe_daemon(paths).await {
                 // The socket answered, so the agent is up even if its pid file
                 // is missing or unreadable; say so rather than print a blank.
-                let contents = std::fs::read_to_string(&paths.pid).ok();
-                let pid = contents
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|pid| !pid.is_empty())
-                    .unwrap_or("unknown");
-                println!("Agent is running (pid {pid})");
+                match paths.read_pid() {
+                    Some(pid) => println!("Agent is running (pid {pid})"),
+                    None => println!("Agent is running (pid unknown)"),
+                }
                 println!("Socket:      {}", paths.socket.display());
                 if let Some(addr) = daemon.addr {
                     println!("Attached to: {addr}");
@@ -197,12 +194,7 @@ async fn run_via_daemon(
         }
         Mode::TestLed => send_daemon_command(&Request::TestLed, "Blink", paths).await,
         Mode::Metric(_) | Mode::Monitor => {
-            let mut renderer = StreamRenderer::new(
-                cli.output_format(),
-                mode.prefix(),
-                cli.sample_count(&mode),
-                log_level,
-            );
+            let mut renderer = renderer(cli, &mode, log_level);
 
             let work = agent::client::execute(&Request::Subscribe, paths, |resp| {
                 if let Some(m) = resp.to_measurement() {
@@ -273,6 +265,18 @@ fn print_rtc_drift(m: &Measurement) {
     println!("drift_seconds = {}", drift.num_seconds());
 }
 
+/// The renderer a streaming run prints through. Built identically whether the
+/// samples come straight off the BLE link or by way of an agent, so the two
+/// paths cannot drift apart on format, sample count, or the closing summary.
+fn renderer(cli: &Cli, mode: &Mode, log_level: LogLevel) -> StreamRenderer {
+    StreamRenderer::new(
+        cli.output_format(),
+        mode.prefix(),
+        cli.sample_count(mode),
+        log_level,
+    )
+}
+
 /// Run `work` until it finishes, `duration` seconds elapse, or Ctrl-C. The
 /// early exits are not errors: a `--duration` run ending is a normal stop, and
 /// dropping `work` here lets its renderer print the summary.
@@ -312,12 +316,7 @@ async fn run(conn: &mut Connection, mode: Mode, cli: &Cli, log_level: LogLevel) 
         Mode::Power(on) => conn.power(on).await,
         Mode::TestLed => conn.blink_led().await,
         Mode::Metric(_) | Mode::Monitor => {
-            let mut renderer = StreamRenderer::new(
-                cli.output_format(),
-                mode.prefix(),
-                cli.sample_count(&mode),
-                log_level,
-            );
+            let mut renderer = renderer(cli, &mode, log_level);
             let work = conn.subscribe_measure(|m| renderer.record(&m));
             until_deadline(work, cli.duration).await
         }
