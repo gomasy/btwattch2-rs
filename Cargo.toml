@@ -15,6 +15,15 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "signal"] }
 uuid = "1.24.0"
 
+[lints.clippy]
+# A dropped connection or a malformed frame may not be able to take the process
+# down. Nothing outside the tests unwraps today; denying it is what keeps that
+# true as the code grows, and the `check` workflow runs clippy with -D warnings
+# so it is enforced on every push. Tests are exempt via clippy.toml — there, a
+# panic is how a failure is reported.
+unwrap_used = "deny"
+expect_used = "deny"
+
 [profile.release]
 lto = true
 strip = true
