@@ -16,8 +16,7 @@ const BLINK_LED: [u8; 5] = [0x3E, 0x01, 0x02, 0x02, 0x0F];
 ///
 /// Fails on a year the wire format cannot carry. The field is a single byte of
 /// `year - 1900`, so anything outside 1900..=2155 would otherwise wrap silently
-/// and set the device to a different year than the one asked for — the one
-/// failure mode a clock-setting command must not have.
+/// and set the device to a year other than the one asked for.
 pub fn rtc(time: &DateTime<Local>) -> Result<Vec<u8>> {
     let Ok(year) = u8::try_from(time.year() - 1900) else {
         bail!(
@@ -101,8 +100,6 @@ mod tests {
         assert_eq!(crc8(&[]), 0x00);
     }
 
-    /// A year the single-byte field cannot carry has to be an error rather than
-    /// a frame that sets the device to some other year.
     #[test]
     fn rtc_rejects_a_year_the_wire_cannot_carry() {
         for year in [1899, 2156] {

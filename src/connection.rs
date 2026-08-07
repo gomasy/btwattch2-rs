@@ -37,8 +37,8 @@ const CONNECT_RETRIES: usize = 5;
 /// shorter status reply to a one-shot command.
 pub(crate) const MEASUREMENT_FRAME_MIN_LEN: usize = 30;
 
-/// Largest frame the device ever sends. Used only to bound the reassembly
-/// buffer, so a desynchronized stream cannot grow it without limit.
+/// Largest frame the device ever sends. Bounds the reassembly buffer, so a
+/// desynchronized stream cannot grow it without limit.
 const MAX_FRAME_LEN: usize = 256;
 
 const VOLTAGE_SCALE: f64 = (1u64 << 24) as f64;
@@ -49,8 +49,7 @@ pub(crate) type Notifications = Pin<Box<dyn Stream<Item = ValueNotification> + S
 
 static INFO: AtomicBool = AtomicBool::new(false);
 
-/// Set the verbosity of informational (`[INFO]`) output. Called once at
-/// startup from the resolved CLI log level.
+/// Set the verbosity of informational (`[INFO]`) output. Called once at startup.
 pub fn set_log_level(level: LogLevel) {
     INFO.store(level == LogLevel::Info, Ordering::Relaxed);
 }
@@ -61,8 +60,6 @@ pub(crate) fn info_enabled() -> bool {
 
 // Print an informational message to stderr, only when --log-level allows it.
 // Warnings and errors are printed unconditionally with plain `eprintln!`.
-// Not exported: every `[INFO]` line about the device now originates in this
-// module, `report_command` included, so nothing outside it needs the macro.
 macro_rules! info {
     ($($arg:tt)*) => {
         if $crate::connection::info_enabled() {
@@ -97,10 +94,8 @@ const DEVICE_NAME: &str = "BTWATTCH2";
 impl ScannedDevice {
     /// Whether this looks like a watt checker. Matched on the advertised name
     /// rather than the address, since the address prefix belongs to the module
-    /// vendor and is shared with unrelated hardware.
-    ///
-    /// A device whose name has not arrived yet cannot be recognised and so is
-    /// not claimed to be one; `--scan-all` is the way to see those.
+    /// vendor and is shared with unrelated hardware. A device whose name has
+    /// not arrived yet is not claimed to be one; `--scan-all` shows those.
     pub fn is_watt_checker(&self) -> bool {
         self.name
             .as_deref()
@@ -179,11 +174,9 @@ impl FrameAssembler {
 }
 
 /// Run `body` with the adapter scanning, stopping the scan however it ends.
-///
-/// The stop has to be unconditional. Both scanning paths make D-Bus calls while
-/// they wait, and a bare `?` on one of those used to return with the adapter
-/// still scanning — which burns power and keeps bluetoothd busy until something
-/// else happens to stop it.
+/// Unconditionally: both scanning paths make D-Bus calls while they wait, and a
+/// bare `?` on one of those would return with the adapter still scanning, which
+/// burns power and keeps bluetoothd busy.
 async fn while_scanning<T>(adapter: &Adapter, body: impl Future<Output = Result<T>>) -> Result<T> {
     adapter
         .start_scan(ScanFilter::default())
@@ -223,14 +216,12 @@ impl Connection {
     }
 
     /// Scan for nearby Bluetooth devices for `duration` and return the unique
-    /// ones seen, keyed by address. Useful for discovering the device's BD
-    /// address before a first connection.
+    /// ones seen.
     ///
     /// BlueZ hands back every device it has ever seen, not just the ones in
     /// range, so results are limited to those that advertised an RSSI at some
-    /// point during the window — the property it drops once a device stops being
-    /// discovered. Without that, a scan lists neighbours that moved out months
-    /// ago.
+    /// point during the window — the property it drops once a device stops
+    /// being discovered. Without that, a scan lists neighbours long gone.
     pub async fn scan(index: usize, duration: Duration) -> Result<Vec<ScannedDevice>> {
         let manager = Manager::new().await?;
         let name = format!("hci{index}");
@@ -254,10 +245,9 @@ impl Connection {
     /// each round reports.
     ///
     /// Every device seen is kept, silent ones included, so the memo below can
-    /// skip them. Filtering them out here instead would mean they never enter
-    /// the map and so get re-polled every round — one D-Bus round trip per
-    /// remembered device, which on a host with a long Bluetooth history is
-    /// hundreds of pointless calls per scan.
+    /// skip them. Filtering them out here would mean they never enter the map
+    /// and so get re-polled every round — one D-Bus round trip each, which on a
+    /// host with a long Bluetooth history is hundreds per scan.
     async fn poll_devices(
         adapter: &Adapter,
         duration: Duration,
@@ -277,9 +267,9 @@ impl Connection {
                     continue;
                 };
                 // Merged rather than overwritten: BlueZ drops the RSSI again once
-                // a device stops being discovered, and overwriting would take a
+                // a device stops being discovered, so overwriting would take a
                 // device that advertised early in a long window back out of the
-                // results — the very thing the RSSI is being used to prove.
+                // results.
                 let (name, rssi) = found.entry(addr).or_default();
                 if props.local_name.is_some() {
                     *name = props.local_name;
@@ -397,8 +387,8 @@ impl Connection {
     }
 
     /// The RX notification stream ended: re-establish the link and return a
-    /// fresh subscription. The "stream closed, reconnecting" warning is emitted
-    /// here so it is logged exactly once, regardless of which caller drives it.
+    /// fresh subscription. The warning is emitted here so it is logged exactly
+    /// once, whichever caller drives it.
     pub(crate) async fn reconnect_stream(&mut self) -> Result<Notifications> {
         eprintln!("[WARN] Notification stream closed, reconnecting...");
         self.connect().await?;
@@ -496,9 +486,9 @@ impl Connection {
         let mut assembler = FrameAssembler::new();
         let mut ticker = tokio::time::interval(self.interval);
         // A poll that overruns its period — a write retrying through a reconnect,
-        // say — must not leave a backlog of ticks to fire back-to-back once it
-        // returns. The default would answer a minute of failed writes with a
-        // minute of instant retries; the agent's ticker is set up the same way.
+        // say — must not leave a backlog of ticks to fire back-to-back. The
+        // default would answer a minute of failed writes with a minute of
+        // instant retries.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -553,8 +543,6 @@ impl Connection {
         let mut reconnected = false;
         let mut attempt = 1;
 
-        // `loop` rather than `for`, so the final failure leaves the loop as a
-        // value instead of needing an unreachable arm after it.
         let error = loop {
             // Re-read every attempt: a reconnect along the way replaces `tx`.
             let write_type = if self.tx.properties.contains(CharPropFlags::WRITE) {
@@ -585,8 +573,8 @@ impl Connection {
 }
 
 /// The device's status byte from a one-shot command reply, or `None` if the
-/// frame is too short to carry one. Kept here with the rest of the wire layout
-/// so the agent does not need its own copy of the offset.
+/// frame is too short to carry one. Kept with the rest of the wire layout so
+/// the agent needs no copy of the offset.
 pub(crate) fn command_status(frame: &[u8]) -> Option<u8> {
     frame.get(4).copied()
 }
@@ -604,9 +592,8 @@ pub(crate) fn report_command(action: &str, code: u8) -> Result<()> {
 
 /// Drive `notifications` through `assembler` until a frame of `kind` arrives,
 /// handing every other completed frame to `on_other`. `None` means the stream
-/// ended — the caller decides whether that is worth reconnecting for (a one-shot
-/// command) or fatal (the agent's actor), which is the only thing the two
-/// callers disagree about.
+/// ended; the caller decides whether that is worth reconnecting for (a one-shot
+/// command) or fatal (the agent's actor).
 ///
 /// Not wrapped in a timeout: the agent bounds a single wait, while a one-shot
 /// bounds the whole reconnect-and-retry sequence around it.
@@ -631,9 +618,8 @@ pub(crate) async fn next_matching_frame(
 }
 
 pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
-    // Take the fields off a fixed-size array rather than the slice, so the
-    // length check below and the offsets that follow cannot drift apart: every
-    // index is checked against the array's own type.
+    // A fixed-size array rather than the slice, so every offset below is
+    // checked against the array's own type instead of a separate length check.
     let body: &[u8; MEASUREMENT_FRAME_MIN_LEN] = frame
         .first_chunk()
         .ok_or_else(|| anyhow!("frame too short: {} bytes", frame.len()))?;
@@ -664,9 +650,8 @@ pub(crate) fn read_measure(frame: &[u8]) -> Result<Measurement> {
     })
 }
 
-/// Parse a reassembled frame into a measurement. On failure it logs the single
-/// "Failed to parse measurement" error and yields `None`, so callers can skip
-/// the frame and keep streaming instead of duplicating that log line.
+/// Parse a reassembled frame into a measurement, logging and yielding `None` on
+/// failure so callers can skip the frame and keep streaming.
 pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
     match read_measure(frame) {
         Ok(m) => Some(m),
@@ -683,8 +668,8 @@ pub(crate) fn try_measurement(frame: &[u8]) -> Option<Measurement> {
 pub(crate) mod testutil {
     use super::*;
 
-    /// A fixed timestamp, so a rendered line can be asserted whole. Unambiguous
-    /// in every timezone.
+    /// A fixed timestamp, unambiguous in every timezone, so a rendered line can
+    /// be asserted whole.
     pub const EPOCH: i64 = 1609304963;
 
     /// A measurement with round numbers, so a formatted value reads as written.
@@ -703,8 +688,8 @@ pub(crate) mod testutil {
     }
 }
 
-/// Little-endian u48. Reads at most 6 bytes and zero-pads a shorter slice, so
-/// the only caller's offsets cannot turn into a panic if they ever slip.
+/// Little-endian u48. Reads at most 6 bytes and zero-pads a shorter slice, so a
+/// slipped offset cannot turn into a panic.
 fn u48_le(payload: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
     for (dst, src) in bytes.iter_mut().zip(payload.iter().take(6)) {
@@ -897,8 +882,8 @@ mod tests {
         assert!(others.is_empty());
     }
 
-    /// The behaviour the agent depends on: a measurement arriving while a
-    /// command is in flight goes to `on_other` rather than being dropped.
+    /// The agent depends on this: a measurement arriving while a command is in
+    /// flight goes to `on_other` rather than being dropped.
     #[tokio::test]
     async fn next_matching_frame_hands_over_other_frames() {
         let stray = measurement_frame();
