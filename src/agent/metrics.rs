@@ -92,7 +92,24 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
         return;
     }
 
-    let response = match route(&line) {
+    let route = route(&line);
+
+    // Drain the rest of the head before replying. A client still writing when
+    // its socket is closed sees the reset rather than the response, which turns
+    // a plain 404 into a connection error.
+    let mut rest = String::new();
+    while let Ok(n) = reader.read_line(&mut rest).await {
+        if n == 0 || rest.trim_end().is_empty() {
+            break;
+        }
+        rest.clear();
+    }
+
+    // Sampled here rather than before the drain, so the body describes the
+    // device as of the moment it is sent. A client that dawdles over its headers
+    // has the whole exchange timeout to do it in, and reading first would let it
+    // be answered with a measurement that old.
+    let response = match route {
         Some(Route::Metrics) => {
             let reading = stats.reading();
             let body = output::metrics_exposition(
@@ -113,17 +130,6 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
         }
         Some(Route::NotFound) | None => response("404 Not Found", TEXT_TYPE, "", ""),
     };
-
-    // Drain the rest of the head before replying. A client still writing when
-    // its socket is closed sees the reset rather than the response, which turns
-    // a plain 404 into a connection error.
-    let mut rest = String::new();
-    while let Ok(n) = reader.read_line(&mut rest).await {
-        if n == 0 || rest.trim_end().is_empty() {
-            break;
-        }
-        rest.clear();
-    }
 
     writer.write_all(response.as_bytes()).await.ok();
     writer.flush().await.ok();
