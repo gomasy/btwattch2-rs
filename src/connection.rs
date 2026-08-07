@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,10 @@ const C_TX: Uuid = uuid!("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
 pub(crate) const C_RX: Uuid = uuid!("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a scan re-reads the adapter's device list. Each poll is a D-Bus
+/// round trip per remembered device, so this trades noticing a device promptly
+/// against how hard the scan leans on bluetoothd.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a one-shot command waits for its reply frame.
 pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_RETRIES: usize = 5;
@@ -173,6 +178,22 @@ impl FrameAssembler {
     }
 }
 
+/// Run `body` with the adapter scanning, stopping the scan however it ends.
+///
+/// The stop has to be unconditional. Both scanning paths make D-Bus calls while
+/// they wait, and a bare `?` on one of those used to return with the adapter
+/// still scanning — which burns power and keeps bluetoothd busy until something
+/// else happens to stop it.
+async fn while_scanning<T>(adapter: &Adapter, body: impl Future<Output = Result<T>>) -> Result<T> {
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .context("failed to start scanning (is Bluetooth powered on?)")?;
+    let result = body.await;
+    adapter.stop_scan().await.ok();
+    result
+}
+
 pub struct Connection {
     name: String,
     addr: BDAddr,
@@ -215,17 +236,33 @@ impl Connection {
         let name = format!("hci{index}");
         let adapter = Self::find_adapter(&manager, &name).await?;
 
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .context("failed to start scanning (is Bluetooth powered on?)")?;
+        let found = while_scanning(&adapter, Self::poll_devices(&adapter, duration)).await?;
 
+        Ok(found
+            .into_iter()
+            .filter_map(|(addr, (name, rssi))| {
+                Some(ScannedDevice {
+                    addr,
+                    name,
+                    rssi: rssi?,
+                })
+            })
+            .collect())
+    }
+
+    /// Re-read the adapter's device list until `duration` elapses, merging what
+    /// each round reports.
+    ///
+    /// Every device seen is kept, silent ones included, so the memo below can
+    /// skip them. Filtering them out here instead would mean they never enter
+    /// the map and so get re-polled every round — one D-Bus round trip per
+    /// remembered device, which on a host with a long Bluetooth history is
+    /// hundreds of pointless calls per scan.
+    async fn poll_devices(
+        adapter: &Adapter,
+        duration: Duration,
+    ) -> Result<HashMap<BDAddr, (Option<String>, Option<i16>)>> {
         let deadline = tokio::time::Instant::now() + duration;
-        // Every device seen, silent ones included, so the memo below can skip
-        // them. Filtering them out here instead would mean they never enter the
-        // map and so get re-polled on every tick — one D-Bus round trip per
-        // remembered device per 500 ms, which on a host with a long Bluetooth
-        // history is hundreds of pointless calls per scan.
         let mut found: HashMap<BDAddr, (Option<String>, Option<i16>)> = HashMap::new();
         loop {
             for dev in adapter.peripherals().await? {
@@ -252,22 +289,10 @@ impl Connection {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                break;
+                return Ok(found);
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(SCAN_POLL_INTERVAL).await;
         }
-
-        adapter.stop_scan().await.ok();
-        Ok(found
-            .into_iter()
-            .filter_map(|(addr, (name, rssi))| {
-                Some(ScannedDevice {
-                    addr,
-                    name,
-                    rssi: rssi?,
-                })
-            })
-            .collect())
     }
 
     async fn find_adapter(manager: &Manager, name: &str) -> Result<Adapter> {
@@ -289,25 +314,22 @@ impl Connection {
         }
 
         info!("Scanning for {addr}...");
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .context("failed to start scanning (is Bluetooth powered on?)")?;
+        while_scanning(adapter, Self::await_device(adapter, addr)).await
+    }
 
+    /// Wait for `addr` to turn up in the adapter's device list, giving up after
+    /// `SCAN_TIMEOUT`.
+    async fn await_device(adapter: &Adapter, addr: BDAddr) -> Result<Peripheral> {
         let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
-        let device = loop {
+        loop {
             if let Some(device) = Self::lookup(adapter, addr).await? {
-                break device;
+                return Ok(device);
             }
             if tokio::time::Instant::now() >= deadline {
-                adapter.stop_scan().await.ok();
                 bail!("device {addr} not found");
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-
-        adapter.stop_scan().await.ok();
-        Ok(device)
+            tokio::time::sleep(SCAN_POLL_INTERVAL).await;
+        }
     }
 
     async fn lookup(adapter: &Adapter, addr: BDAddr) -> Result<Option<Peripheral>> {
