@@ -25,8 +25,8 @@ const ENERGY_NAME: &str = "energy_wh";
 const ENERGY_HELP: &str = "Energy accumulated this session in watt-hours";
 
 /// The fields of a record, in output order: the channels, then session energy.
-/// Every format that carries energy composes its record from this, so a channel
-/// added or renamed shows up everywhere at once instead of in one arm.
+/// Composed from here by every format that carries energy, so a channel added
+/// or renamed shows up everywhere at once.
 fn fields(m: &Measurement, energy_wh: f64) -> impl Iterator<Item = (&'static str, f64)> {
     CHANNELS
         .iter()
@@ -52,11 +52,9 @@ fn field_names() -> impl Iterator<Item = &'static str> {
 /// Deliberately not the same bytes as `--format prometheus`: that renders one
 /// sample per line as it streams, timestamp included, for a textfile collector.
 /// A scraped endpoint reports the *current* reading, so it carries no per-sample
-/// timestamp — a scraper stamps what it reads, and a stale sample is better
-/// described by `up 0` than by a backdated one it may refuse outright. Session
-/// energy is left out for the same reason: it is accumulated per run by a
-/// streaming client, so a scrape has no run to read it from. The channel list,
-/// names, and help strings are otherwise the same either way.
+/// timestamp — the scraper stamps what it reads — and no session energy, which
+/// only a streaming run accumulates. The channels, names, and help strings are
+/// the same either way.
 ///
 /// `sample` is the latest measurement, `up` whether it is fresh enough to stand
 /// for the device's present state. When it is not, the channels are omitted
@@ -65,8 +63,8 @@ fn field_names() -> impl Iterator<Item = &'static str> {
 pub fn metrics_exposition(prefix: &str, sample: Option<&Measurement>, up: bool) -> String {
     let mut out = String::new();
     let mut gauge = |name: &str, help: &str, value: &dyn std::fmt::Display| {
-        // Infallible: the only error a `fmt::Write` into a String can report is
-        // one the formatter itself raises, and none of these do.
+        // Infallible: a `fmt::Write` into a String only fails when a formatter
+        // does, and none of these do.
         use std::fmt::Write;
         let _ = write!(
             out,
@@ -96,9 +94,9 @@ pub fn metrics_exposition(prefix: &str, sample: Option<&Measurement>, up: bool) 
 
 /// One JSON Lines record. Serialized through serde, which gets the escaping and
 /// the `null` for a non-finite float that a formatted string would not, but
-/// written entry by entry: a `Value` or `json!` map sorts keys alphabetically
-/// and would reorder the documented column layout, and a `#[derive]`d struct
-/// would re-list the channels that `CHANNELS` already owns.
+/// entry by entry: a `Value` or `json!` map would sort the documented column
+/// order alphabetically, and a `#[derive]`d struct would re-list the channels
+/// `CHANNELS` already owns.
 struct JsonLine<'a> {
     measurement: &'a Measurement,
     energy_wh: f64,
@@ -119,9 +117,8 @@ impl Serialize for JsonLine<'_> {
 /// a header (CSV) or a metric declaration block (Prometheus) print it once,
 /// before the first measurement.
 ///
-/// Machine-readable formats emit every value at full precision, `energy_wh`
-/// included, and leave rounding to whatever consumes them. Only `plain` and the
-/// end-of-run summary round, because those are read by people.
+/// Only `plain` rounds, because it is read by people; the machine-readable
+/// formats emit full precision and leave rounding to their consumers.
 struct Printer {
     format: OutputFormat,
     prefix: String,
@@ -137,8 +134,7 @@ impl Printer {
         }
     }
 
-    /// Render one measurement. `energy_wh` is the session energy so far,
-    /// computed by the caller's `Stats`.
+    /// Render one measurement, with the session energy so far.
     fn print(&mut self, m: &Measurement, energy_wh: f64) {
         match self.format {
             OutputFormat::Plain => println!(
@@ -176,9 +172,8 @@ impl Printer {
                 };
                 match serde_json::to_string(&line) {
                     Ok(json) => println!("{json}"),
-                    // Nothing in `JsonLine` can fail to serialize, but skipping
-                    // one sample beats taking the whole run down if that ever
-                    // stops being true.
+                    // Nothing in `JsonLine` can fail to serialize, but if that
+                    // ever changes, skipping a sample beats ending the run.
                     Err(e) => eprintln!("[ERR] Failed to encode measurement: {e}"),
                 }
             }
@@ -273,10 +268,9 @@ impl Channel {
     }
 }
 
-/// Running statistics over a stream of measurements, printed as a summary to
-/// stderr when a monitoring run ends. Energy is integrated over the actual
-/// wall-clock time between samples, so the first sample contributes nothing
-/// and reconnect gaps are accounted for at their real length.
+/// Running statistics over a stream of measurements. Energy is integrated over
+/// the wall-clock time actually elapsed between samples, so the first sample
+/// contributes nothing and reconnect gaps count at their real length.
 struct Stats {
     count: u64,
     channels: [Channel; 4],
@@ -294,8 +288,7 @@ impl Stats {
         }
     }
 
-    /// Fold a measurement into the running statistics and return the session
-    /// energy so far in watt-hours.
+    /// Fold a measurement in and return the session energy so far, in watt-hours.
     fn record(&mut self, m: &Measurement) -> f64 {
         let now = Instant::now();
         if let Some(last) = self.last_sample {
