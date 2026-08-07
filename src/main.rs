@@ -142,28 +142,32 @@ async fn run_agent_command(
             Ok(())
         }
         AgentAction::Status => {
-            if let Some(daemon) = agent::probe_daemon(paths).await {
-                // The socket answered, so the agent is up even if its pid file
-                // is missing or unreadable; say so rather than print a blank.
-                match paths.read_pid() {
-                    Some(pid) => println!("Agent is running (pid {pid})"),
-                    None => println!("Agent is running (pid unknown)"),
-                }
-                println!("Socket:      {}", paths.socket.display());
-                if let Some(addr) = daemon.addr {
-                    println!("Attached to: {addr}");
-                }
-                if let Some(status) = &daemon.status {
-                    print_agent_status(status);
-                }
-            } else {
+            match agent::probe_daemon(paths).await {
+                Some(daemon) => print_daemon(&daemon, paths),
                 // Name the socket: with a profile per device there are several
                 // an invocation could have meant, and which one was checked is
                 // the first question when the answer is "not running".
-                println!("Agent is not running ({})", paths.socket.display());
+                None => println!("Agent is not running ({})", paths.socket.display()),
             }
             Ok(())
         }
+    }
+}
+
+/// Report a live agent: who it is, where it listens, and what it says about
+/// itself. The socket answered, so the agent is up even when its pid file is
+/// missing or unreadable — say so rather than print a blank.
+fn print_daemon(daemon: &agent::DaemonInfo, paths: &agent::AgentPaths) {
+    match paths.read_pid() {
+        Some(pid) => println!("Agent is running (pid {pid})"),
+        None => println!("Agent is running (pid unknown)"),
+    }
+    println!("Socket:      {}", paths.socket.display());
+    if let Some(addr) = daemon.addr {
+        println!("Attached to: {addr}");
+    }
+    if let Some(status) = &daemon.status {
+        print_agent_status(status);
     }
 }
 
