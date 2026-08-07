@@ -1,8 +1,6 @@
 # btwattch2-rs
 
-Rust toolkit for the RS-BTWATTCH2 Bluetooth power meter
-
-A tool for controlling the RATOC Systems RS-BTWATTCH2 Bluetooth Watt Checker from Linux. It can measure voltage, current, and power, operate the power switch, and synchronize the RTC on the main unit.
+Rust toolkit for controlling the RATOC Systems RS-BTWATTCH2 Bluetooth Watt Checker from Linux. It can measure voltage, current, and power, operate the power switch, and synchronize the RTC on the main unit.
 
 This is a Rust port of [ruby-btwattch2](https://github.com/gomasy/ruby-btwattch2).
 
@@ -59,7 +57,7 @@ Options:
 
 ### Discovering the device (`--scan`)
 
-List nearby watt checkers (address, name, RSSI) without connecting. Useful for finding the `addr` to pass to the other commands. Only devices currently advertising are listed: BlueZ also remembers everything it has ever seen, and those would otherwise pad the results with neighbours long out of range.
+List nearby watt checkers (address, name, RSSI) without connecting, to find the `addr` the other commands take. Only devices currently advertising are listed: BlueZ also remembers everything it has ever seen, and those would otherwise pad the results with neighbours long out of range.
 
 ```console
 # btwattch2 --scan
@@ -67,7 +65,7 @@ CB:DF:6B:12:34:56    RS-BTWATTCH2    rssi=-62
 [INFO] 7 other device(s) hidden; use --scan-all to list them
 ```
 
-Devices are recognised by their advertised name, so anything that has not sent one yet is counted as hidden rather than listed. Use `--scan-all` to see every device instead — worth trying if a meter you expect does not appear:
+Devices are recognised by their advertised name, so one that has not sent it yet is counted as hidden. `--scan-all` lists every device instead — worth trying if a meter you expect does not appear:
 
 ```console
 # btwattch2 --scan-all
@@ -79,7 +77,7 @@ F4:12:00:AB:CD:EF    (unknown)       rssi=-88
 
 Run with `--addr` set to the Bluetooth address of the device, and measurements are printed every `--interval` (default: 1 second).
 
-`--interval` accepts seconds or milliseconds — `2s`, `0.5`, `500ms` — between a floor of 10 ms and a ceiling of a day. Sub-second polling is useful for catching inrush current and switching transients, but the device answers each request over BLE at its own pace: ask faster than it can reply and the extra requests only queue behind replies that cannot arrive any sooner.
+`--interval` accepts seconds or milliseconds — `2s`, `0.5`, `500ms` — between a floor of 10 ms and a ceiling of a day. Sub-second polling is useful for catching inrush current and switching transients, but the device answers each request at its own pace: ask faster than it can reply and the extra requests only queue up.
 
 ```console
 # btwattch2 --addr CB:DF:6B:12:34:56
@@ -88,7 +86,7 @@ V = 104.19976472854614, A = 1.1281732693314552, W = 105.39636832475662, PF = 0.8
 ...
 ```
 
-`PF` is the power factor, derived as `wattage / (voltage * ampere)`. `Wh` is the energy accumulated during this run, integrated over the wall-clock time actually elapsed between samples — so the first sample contributes nothing, and a reconnect gap is accounted for at its real length rather than at the nominal interval.
+`PF` is the power factor, derived as `wattage / (voltage * ampere)`. `Wh` is the energy accumulated during this run, integrated over the wall-clock time actually elapsed between samples — so the first sample contributes nothing, and a reconnect gap is accounted for at its real length.
 
 On exit (Ctrl-C, `--count`, or `--duration`) a summary of min/max/avg per channel and the total energy is printed to stderr.
 
@@ -96,7 +94,7 @@ On exit (Ctrl-C, `--count`, or `--duration`) a summary of min/max/avg per channe
 
 Measurements can be rendered in several machine-friendly formats for piping into other tools. An explicit `--format` always wins; otherwise `--metric-name` defaults to `mackerel` and everything else to `plain`.
 
-Every format but `plain` emits values at full precision and leaves rounding to whatever consumes them. Only `plain` and the end-of-run summary round, since those are read by people. (The examples below are shortened for readability.)
+Only `plain` and the end-of-run summary round their values, since those are read by people; every other format emits full precision and leaves rounding to whatever consumes it. (The examples below are shortened for readability.)
 
 - `plain` — the human-readable line above (default).
 - `json` — one JSON object per line (JSON Lines):
@@ -127,7 +125,7 @@ Every format but `plain` emits values at full precision and leaves rounding to w
 
 - `mackerel` — Mackerel custom metrics, line-per-metric (used with `--metric-name`).
 
-`--metric-name` accepts a letter or `_` followed by letters, digits, `_`, `.`, or `-`. The `prometheus` format is stricter still and rejects `.` and `-`, since a metric name carrying either produces an exposition no scraper will parse.
+`--metric-name` accepts a letter or `_` followed by letters, digits, `_`, `.`, or `-`. The `prometheus` format is stricter still and rejects `.` and `-`, which would produce an exposition no scraper will parse.
 
 ### Limiting a run (`--count`, `--duration`)
 
@@ -146,10 +144,10 @@ When `--metric-name` is given, a single measurement is printed in Mackerel custo
 # btwattch2 --addr CB:DF:6B:12:34:56 --metric-name wattchecker1
 wattchecker1.voltage    104.80763912200928      1609304963
 wattchecker1.ampere     1.120739296078682       1609304963
-wattchecker1.wattage    104.89565205574036       1609304963
+wattchecker1.wattage    104.89565205574036      1609304963
 ```
 
-Informational (`[INFO]`) messages on stderr are suppressed in this mode so that the output stays quiet when invoked from mackerel-agent. Pass `-d` / `--debug` to print them for troubleshooting.
+Informational (`[INFO]`) messages are suppressed in this mode so that nothing but metrics reaches mackerel-agent. Pass `-d` / `--debug` to print them for troubleshooting.
 
 Note: The epoch of the metrics is based on the RTC of the device. Synchronize the RTC periodically. (See "Time synchronization" below.)
 
@@ -198,7 +196,9 @@ Every command normally connects and disconnects BLE, which takes several seconds
 
 Any number of commands may stream at once. The device is polled once per interval however many are listening, and each measurement is handed to all of them, so a live `btwattch2 --count 5` and a periodic `--metric-name` run no longer collide.
 
-A client that stops reading its end is dropped once it falls 64 measurements behind, with a warning on the agent's stderr. The agent will not hold samples indefinitely for one wedged subscriber, and the clients still reading are unaffected.
+A client that stops reading its end is dropped once it falls 64 measurements behind, with a warning on the agent's stderr, so one wedged subscriber cannot make the agent hold samples indefinitely. The clients still reading are unaffected.
+
+When the agent is running, CLI commands detect it and route through the socket; when it is not, they fall back to direct BLE. No flags needed either way.
 
 #### Status
 
@@ -249,29 +249,21 @@ scrape_configs:
 Notes:
 
 - `btwattch2_up` is `0` when the last reading is too old to describe the device — no sample yet, or a link that dropped. The channel gauges are then omitted rather than repeated, since a gauge that keeps returning the last value it saw makes a dead link look like a steady load. The freshness window is three intervals, or five seconds, whichever is longer.
-- Unlike `--format prometheus`, the endpoint carries no per-sample timestamp: a scraper stamps what it reads, and a stale sample is better described by `up 0` than by a backdated one.
+- Unlike `--format prometheus`, the endpoint carries no per-sample timestamp: a scraper stamps what it reads.
 - Session energy is not exposed. It is accumulated per run by the streaming client, so there is no meaningful value for a scrape to read.
 - The endpoint is plain HTTP with no authentication. Bind it to a loopback address unless something in front of it provides access control.
 - The metric names are fixed. Two agents scraped by one Prometheus are told apart by the target's own labels, not by renaming their metrics.
 
-The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override the socket path with `--socket <path>` — pass it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
+#### Socket and pid file
+
+The agent listens on `$XDG_RUNTIME_DIR/btwattch2.sock`. When `XDG_RUNTIME_DIR` is unset — as it usually is under systemd or `sudo` — it falls back to `/run/btwattch2/btwattch2.sock`, creating `/run/btwattch2` mode 0700 on first start. Override with `--socket <path>`, passing it on *every* command (including `agent start`, so the daemon and its clients agree on the location):
 
 ```console
 # btwattch2 --socket /run/btwattch2/device-a.sock --addr CB:DF:6B:12:34:56 agent start
 # btwattch2 --socket /run/btwattch2/device-a.sock --on
 ```
 
-The pid file is derived from the socket path by extension (`btwattch2.sock` → `btwattch2.pid`) by default, so usually you only set the socket. Override it independently with `--pid-file <path>` if you need the pid elsewhere. Run multiple agents on separate sockets (and pid files) to manage several devices at once — the config file can hold each one's socket, so `--device` alone routes to the right agent (see "Configuration file" below).
-
-When the agent is running, CLI commands detect it and route through the socket. When it is not running, they fall back to direct BLE as before — no flags needed.
-
-Because the agent holds the connection, its `--addr`, `--index`, and `--interval` are fixed at `agent start` and a client cannot change them. `--index` and `--interval` on a client are ignored with a warning. An explicit `--addr` naming a *different* device is an error rather than a warning — otherwise a command meant for one meter would silently operate another:
-
-```console
-# btwattch2 --addr CB:DF:6B:AA:BB:CC --off
-Error: the agent on /run/btwattch2/btwattch2.sock is attached to CB:DF:6B:12:34:56, but
---addr asks for CB:DF:6B:AA:BB:CC; stop that agent or point --socket at the one holding it
-```
+The pid file defaults to the socket path with a `.pid` extension (`btwattch2.sock` → `btwattch2.pid`); `--pid-file <path>` overrides it independently. Run multiple agents on separate sockets to manage several devices at once — the config file can hold each one's socket, so `--device` alone routes to the right agent (see "Configuration file" below).
 
 Under systemd, let the unit own the runtime directory rather than relying on the fallback:
 
@@ -282,11 +274,13 @@ RuntimeDirectoryMode=0700
 ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
 ```
 
+The agent itself removes its socket and pid file on exit, including on SIGINT and SIGTERM. While it runs it holds an exclusive lock on the pid file, so a second `agent start` on the same paths fails with `agent is already running (pid N)` rather than unlinking the first one's socket — including when the two are started at the same moment. The kernel releases the lock however the agent exits, so a pid file left behind by a crash never locks the agent out of starting again.
+
 #### Socket permissions
 
 The socket and the pid file are created mode 0600 by default, so the agent's permissions do not depend on the umask it inherited — connecting to a unix socket takes write permission on it, and the agent holds a mains switch.
 
-To let other users reach the agent, set `socket_mode` in the config file to the mode you want, written as octal exactly as `chmod` takes it:
+To let other users reach the agent, set `socket_mode` in the config file, written as octal exactly as `chmod` takes it:
 
 ```toml
 socket_mode = 0666
@@ -294,18 +288,19 @@ socket_mode = 0666
 
 Only `agent start` acts on it; clients merely connect to the socket it created. Like `socket`, it can sit in a `[devices.<name>]` section so each agent gets its own. A value that is not octal permission bits is an error rather than a silent fall back to 0600, which would lock out the users it was set to admit.
 
-Note that reaching a socket also takes search permission on every directory above it, and the default runtime directory is 0700 — so widening the socket alone is not enough. Give the directory a matching mode as well, either through systemd or by creating it beforehand (an existing directory is left as it is):
+Reaching a socket also takes search permission on every directory above it, and the default runtime directory is 0700 — so widening the socket alone is not enough. Give the directory a matching mode as well: `RuntimeDirectoryMode=0755` in the unit above, or create the directory beforehand (an existing one is left as it is).
 
-```ini
-[Service]
-RuntimeDirectory=btwattch2
-RuntimeDirectoryMode=0755
-ExecStart=/usr/local/bin/btwattch2 --socket /run/btwattch2/agent.sock --addr CB:DF:6B:12:34:56 agent start
+#### Device selection
+
+Because the agent holds the connection, its `--addr`, `--index`, and `--interval` are fixed at `agent start` and a client cannot change them. `--index` and `--interval` on a client are ignored with a warning. An explicit `--addr` naming a *different* device is an error rather than a warning — otherwise a command meant for one meter would silently operate another:
+
+```console
+# btwattch2 --addr CB:DF:6B:AA:BB:CC --off
+Error: the agent on /run/btwattch2/btwattch2.sock is attached to CB:DF:6B:12:34:56, but
+--addr asks for CB:DF:6B:AA:BB:CC; stop that agent or point --socket at the one holding it
 ```
 
-The agent removes its socket and pid file on exit, including on SIGINT and SIGTERM. While it runs it holds an exclusive lock on the pid file, so a second `agent start` on the same paths fails with `agent is already running (pid N)` rather than unlinking the first one's socket — including when the two are started at the same moment. The kernel releases the lock however the agent exits, so a pid file left behind by a crash never locks the agent out of starting again.
-
-> **Upgrading:** the socket protocol changed between 1.0 and 1.1, so **restart the agent when you replace the binary**. A client and an agent from those two versions will fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error; measurement streaming is unaffected. Later additions to the protocol are backward compatible — a new client asking an older agent for its status simply gets the fields that agent knows about — but the agent still has to be restarted to serve the metrics endpoint or report the new status fields.
+> **Upgrading: restart the agent when you replace the binary.** The socket protocol changed between 1.0 and 1.1: a client and an agent from those two versions fail on `--on`, `--off`, `--set-rtc`, and `--test-led` with a parse error, though measurement streaming is unaffected. Later additions are backward compatible — a new client asking an older agent for its status gets the fields that agent knows about — but the agent still has to be restarted before it can serve the metrics endpoint or report the new fields.
 
 ### Configuration file
 
