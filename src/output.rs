@@ -122,14 +122,14 @@ impl Serialize for JsonLine<'_> {
 /// Machine-readable formats emit every value at full precision, `energy_wh`
 /// included, and leave rounding to whatever consumes them. Only `plain` and the
 /// end-of-run summary round, because those are read by people.
-pub struct Printer {
+struct Printer {
     format: OutputFormat,
     prefix: String,
     header_printed: bool,
 }
 
 impl Printer {
-    pub fn new(format: OutputFormat, prefix: &str) -> Self {
+    fn new(format: OutputFormat, prefix: &str) -> Self {
         Self {
             format,
             prefix: prefix.to_string(),
@@ -139,7 +139,7 @@ impl Printer {
 
     /// Render one measurement. `energy_wh` is the session energy so far,
     /// computed by the caller's `Stats`.
-    pub fn print(&mut self, m: &Measurement, energy_wh: f64) {
+    fn print(&mut self, m: &Measurement, energy_wh: f64) {
         match self.format {
             OutputFormat::Plain => println!(
                 "V = {}, A = {}, W = {}, PF = {:.4}, Wh = {:.3}",
@@ -277,7 +277,7 @@ impl Channel {
 /// stderr when a monitoring run ends. Energy is integrated over the actual
 /// wall-clock time between samples, so the first sample contributes nothing
 /// and reconnect gaps are accounted for at their real length.
-pub struct Stats {
+struct Stats {
     count: u64,
     channels: [Channel; 4],
     last_sample: Option<Instant>,
@@ -285,7 +285,7 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             count: 0,
             channels: Default::default(),
@@ -296,7 +296,7 @@ impl Stats {
 
     /// Fold a measurement into the running statistics and return the session
     /// energy so far in watt-hours.
-    pub fn record(&mut self, m: &Measurement) -> f64 {
+    fn record(&mut self, m: &Measurement) -> f64 {
         let now = Instant::now();
         if let Some(last) = self.last_sample {
             self.energy_wh += m.wattage * (now - last).as_secs_f64() / 3600.0;
@@ -311,7 +311,7 @@ impl Stats {
     }
 
     /// Print min/max/avg per channel and total energy to stderr.
-    pub fn print_summary(&self) {
+    fn print_summary(&self) {
         if self.count == 0 {
             return;
         }
@@ -326,12 +326,6 @@ impl Stats {
             );
         }
         eprintln!("energy: {:.3} Wh", self.energy_wh);
-    }
-}
-
-impl Default for Stats {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

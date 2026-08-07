@@ -604,7 +604,7 @@ impl Cli {
     /// Load a config file if one is requested or present at the default path.
     /// Malformed lines, unknown keys, and invalid values are hard errors so a
     /// typo can't silently fall back to defaults.
-    pub fn load_config(&self) -> Result<Option<FileConfig>> {
+    fn load_config(&self) -> Result<Option<FileConfig>> {
         let path = match &self.config {
             Some(p) => {
                 if !p.exists() {
