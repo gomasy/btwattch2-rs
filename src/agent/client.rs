@@ -2,10 +2,10 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 
-use super::protocol::{Request, Response};
+use super::protocol::{self, Request, Response};
 
 pub async fn execute(
     request: &Request,
@@ -13,11 +13,7 @@ pub async fn execute(
     mut on_response: impl FnMut(Response) -> ControlFlow<()>,
 ) -> Result<()> {
     let mut stream = connect(paths).await?;
-
-    let mut buf = serde_json::to_vec(request)?;
-    buf.push(b'\n');
-    stream.write_all(&buf).await?;
-    stream.flush().await?;
+    protocol::write_message(&mut stream, request).await?;
 
     let (reader, _writer) = stream.split();
     let mut lines = BufReader::new(reader);
@@ -93,6 +89,9 @@ async fn connect(paths: &super::AgentPaths) -> Result<UnixStream> {
 
 #[cfg(test)]
 mod tests {
+    // Only for the raw-bytes test below; everything else frames through
+    // `protocol::write_message`.
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
 
     use super::super::protocol::AgentStatus;
@@ -120,9 +119,7 @@ mod tests {
                 .await
                 .unwrap();
             if let Some(response) = response {
-                let mut buf = serde_json::to_vec(&response).unwrap();
-                buf.push(b'\n');
-                stream.write_all(&buf).await.ok();
+                protocol::write_message(&mut stream, &response).await.ok();
             }
         });
 

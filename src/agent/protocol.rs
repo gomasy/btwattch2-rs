@@ -1,6 +1,23 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::connection::Measurement;
+
+/// Write one message as a line of JSON, which is the framing in both
+/// directions. Kept with the types rather than spelled out at each end, so a
+/// client and an agent cannot come to disagree about where a message stops.
+pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize + ?Sized,
+{
+    let mut buf = serde_json::to_vec(message)?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]

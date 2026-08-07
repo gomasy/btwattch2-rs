@@ -9,12 +9,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use btleplug::api::{BDAddr, ValueNotification};
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 
-use super::protocol::{Request, Response};
+use super::protocol::{self, Request, Response};
 use super::status::AgentStats;
 use crate::cli::{ConnectionConfig, Settings, SocketMode};
 use crate::connection::{
@@ -431,13 +431,15 @@ async fn handle_client(
             let resp = Response::Error {
                 message: format!("invalid request: {e}"),
             };
-            send_response(&mut writer, &resp).await.ok();
+            protocol::write_message(&mut writer, &resp).await.ok();
             return;
         }
     };
 
     if let Some(response) = control_response(&request, cmd_tx.is_closed(), &info) {
-        if send_response(&mut writer, &response).await.is_ok()
+        if protocol::write_message(&mut writer, &response)
+            .await
+            .is_ok()
             && matches!(request, Request::Shutdown)
         {
             shutdown.notify_one();
@@ -455,12 +457,12 @@ async fn handle_client(
         let resp = Response::Error {
             message: "agent shutting down".to_string(),
         };
-        send_response(&mut writer, &resp).await.ok();
+        protocol::write_message(&mut writer, &resp).await.ok();
         return;
     }
 
     while let Some(resp) = resp_rx.recv().await {
-        if send_response(&mut writer, &resp).await.is_err() {
+        if protocol::write_message(&mut writer, &resp).await.is_err() {
             break;
         }
         if !matches!(resp, Response::Measurement { .. }) {
@@ -488,17 +490,6 @@ fn control_response(request: &Request, actor_gone: bool, info: &AgentInfo) -> Op
         Request::Shutdown => Some(Response::Ok),
         _ => None,
     }
-}
-
-async fn send_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &Response,
-) -> Result<()> {
-    let mut buf = serde_json::to_vec(resp)?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 /// A failure that costs us the notification stream. The streaming clients are
