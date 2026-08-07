@@ -15,8 +15,8 @@ const METRIC_PREFIX: &str = "btwattch2";
 /// The whole exchange, from the first byte of the request to the last of the
 /// response. Bounds a client that connects and then says nothing.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Cap on the request head we will read. Nothing in a scrape needs more, and
-/// the limit is what keeps a client from making us buffer without end.
+/// Cap on the request head we will read. Nothing in a scrape needs more, and it
+/// keeps a client from making us buffer without end.
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 /// The exposition format's content type, as scrapers expect it.
 const EXPOSITION_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -105,10 +105,9 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
         rest.clear();
     }
 
-    // Sampled here rather than before the drain, so the body describes the
-    // device as of the moment it is sent. A client that dawdles over its headers
-    // has the whole exchange timeout to do it in, and reading first would let it
-    // be answered with a measurement that old.
+    // Sampled after the drain, so the body describes the device as of the
+    // moment it is sent: a client has the whole exchange timeout to dawdle over
+    // its headers, and sampling first would answer it with a reading that old.
     let response = match route {
         Some(Route::Metrics) => {
             let reading = stats.reading();
@@ -135,9 +134,9 @@ async fn handle(stream: TcpStream, stats: &AgentStats) {
     writer.flush().await.ok();
 }
 
-/// Build a complete HTTP/1.1 response. Every reply closes the connection:
-/// keeping it alive would buy nothing for a scrape that arrives once an
-/// interval, and costs the state machine that goes with it.
+/// Build a complete HTTP/1.1 response. Every reply closes the connection: for a
+/// scrape that arrives once an interval, keep-alive would buy nothing and cost
+/// the state machine that goes with it.
 fn response(status: &str, content_type: &str, extra_headers: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\n\
@@ -236,8 +235,8 @@ mod tests {
             "{response}"
         );
 
-        // `route` covers the methods themselves; what matters over the wire is
-        // that a rejected one still gets a well-formed reply.
+        // `route` covers the methods; what matters here is that a rejected one
+        // still gets a well-formed reply.
         let response = get(addr, "DELETE /metrics HTTP/1.1\r\n\r\n").await;
         assert!(
             response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),

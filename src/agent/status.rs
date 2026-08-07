@@ -34,11 +34,9 @@ pub struct Reading {
 /// reports and the latest measurement `/metrics` serves.
 ///
 /// Shared state rather than something the actor is asked for, because both
-/// readers run outside it. `Ping` is answered by the connection handler on
-/// purpose — `agent status` stays responsive while the actor is blocked on the
-/// BLE link, which is precisely when its state is worth asking about — and a
-/// scrape must not queue behind a reconnect either. Anything that had to reach
-/// the actor would time out in both cases.
+/// readers run outside it and neither may queue behind the BLE link. Being
+/// blocked on the link is precisely when the agent's state is worth asking
+/// about, and anything that had to reach the actor would time out instead.
 pub struct AgentStats {
     started: Instant,
     interval: Interval,
@@ -48,8 +46,8 @@ pub struct AgentStats {
     reconnects: AtomicU64,
     clients: AtomicUsize,
     /// The most recent sample, for the metrics endpoint and for the age
-    /// `agent status` reports. A short-lived lock, never held across an await:
-    /// the writer clones in, readers clone out.
+    /// `agent status` reports. Never locked across an await: the writer clones
+    /// in, readers clone out.
     latest: Mutex<Option<Sample>>,
 }
 
@@ -98,8 +96,7 @@ impl AgentStats {
     pub fn reading(&self) -> Reading {
         let connected = self.connected.load(Ordering::Relaxed);
         let stale_after = self.stale_after();
-        // One lock for both answers, so the verdict describes the measurement
-        // returned beside it.
+        // One lock for both, so the verdict describes the measurement beside it.
         let guard = self.latest.lock().ok();
         let sample = guard.as_ref().and_then(|latest| latest.as_ref());
         Reading {
@@ -169,7 +166,7 @@ mod tests {
         stats.set_connected(false);
         let reading = stats.reading();
         assert!(!reading.fresh, "a dead link cannot be fresh");
-        // The reading itself stays available, for `/metrics` to describe as down.
+        // Still available, for `/metrics` to describe as down.
         assert!(reading.measurement.is_some());
 
         stats.record_sample(&measurement(100.0));

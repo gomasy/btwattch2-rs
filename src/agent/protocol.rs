@@ -5,8 +5,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::connection::Measurement;
 
 /// Write one message as a line of JSON, which is the framing in both
-/// directions. Kept with the types rather than spelled out at each end, so a
-/// client and an agent cannot come to disagree about where a message stops.
+/// directions. Kept with the types, so a client and an agent cannot come to
+/// disagree about where a message stops.
 pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -34,8 +34,7 @@ pub enum Request {
 /// What the agent reports about itself on a ping, for `agent status`.
 ///
 /// Every field is defaulted, so a reply from an agent too old to send them
-/// parses as a status with nothing to say rather than failing outright — the
-/// same tolerance `addr` gets on `Pong`.
+/// parses as a status with nothing to say rather than failing outright.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentStatus {
@@ -43,8 +42,8 @@ pub struct AgentStatus {
     pub uptime_seconds: u64,
     /// The polling period it was started with.
     pub interval_seconds: f64,
-    /// Whether it currently believes the BLE link is up. A running agent with a
-    /// dead link is the state this exists to make visible.
+    /// Whether it currently believes the BLE link is up — a running agent with
+    /// a dead link is what this exists to make visible.
     pub connected: bool,
     /// Measurements read since start, and how long ago the last one arrived.
     pub samples: u64,
@@ -83,8 +82,8 @@ pub enum Response {
     },
     CommandResult {
         /// The device's status byte; zero means it accepted the command. Only
-        /// the code travels — a `success` flag alongside it would be derived
-        /// state that the wire could contradict.
+        /// the code travels — a `success` flag beside it would be derived state
+        /// the wire could contradict.
         code: u8,
     },
     StreamEnd,
@@ -182,8 +181,7 @@ mod tests {
         ));
     }
 
-    /// Likewise for a status that gained fields since the peer was built: what
-    /// it does send survives, and the rest defaults.
+    /// Likewise for a status that gained fields since the peer was built.
     #[test]
     fn a_partial_status_parses() {
         let resp: Response =

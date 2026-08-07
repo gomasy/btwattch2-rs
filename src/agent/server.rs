@@ -32,10 +32,9 @@ struct AgentInfo {
 /// How many measurements may queue for one client before it is dropped.
 ///
 /// The queue absorbs a client that is briefly slow to read its socket. Past that
-/// it would be absorbing one that has stopped reading altogether — and since
-/// nothing bounds how long that lasts, an unbounded queue turns a single wedged
-/// subscriber into unbounded memory in the agent. Sized for a minute at the
-/// default one-second interval.
+/// it would be absorbing one that has stopped reading altogether, which nothing
+/// bounds — a single wedged subscriber would cost the agent unbounded memory.
+/// Sized for a minute at the default one-second interval.
 const CLIENT_QUEUE_LEN: usize = 64;
 
 struct ActorCommand {
@@ -45,9 +44,8 @@ struct ActorCommand {
 
 /// Owns the socket and pid file for as long as the agent is serving. Every exit
 /// path below — an early `?`, a signal during the initial connect, `agent stop`
-/// — has to take both files with it, and a guard is the only way to say that
-/// once rather than at each `return`. Removal only; whether the agent stopped
-/// cleanly or never got going is `run`'s to report, not a destructor's.
+/// — has to take both files with it, which a guard says once rather than at each
+/// `return`. Removal only; reporting how the agent stopped is `run`'s job.
 struct AgentFiles<'a> {
     paths: &'a super::AgentPaths,
     /// Held for the guard's lifetime, so the claim on the pid file lasts exactly
@@ -77,9 +75,8 @@ impl Drop for AgentFiles<'_> {
 /// The open file is itself the claim: an exclusive `flock` on it is what tells a
 /// live agent from a file a dead one left behind, and the kernel drops it however
 /// the process exits. A pid *written inside* a file cannot do that job — it can
-/// name a recycled pid, it can be edited or removed, and two agents starting at
-/// the same moment can both read it, both conclude nothing is running, and unlink
-/// each other's socket on the way to binding their own.
+/// name a recycled pid, and two agents starting at the same moment can both read
+/// it, both conclude nothing is running, and unlink each other's socket.
 #[derive(Debug)]
 struct PidFile(std::fs::File);
 
@@ -88,10 +85,10 @@ impl PidFile {
     ///
     /// The open refuses to follow a symlink: `--pid-file` can name any path, so
     /// someone who can predict it must not be able to turn the write into a
-    /// clobber of an unrelated file the agent happens to be able to write.
+    /// clobber of an unrelated file the agent can write.
     ///
     /// Nothing is written yet. The startup checks after this one can still bail,
-    /// and until they pass, whatever a previous agent left in the file says more
+    /// and until they pass, what a previous agent left in the file says more
     /// than a pid of ours that is about to stop being true.
     fn claim(paths: &super::AgentPaths) -> Result<Self> {
         let path = &paths.pid;
@@ -119,8 +116,7 @@ impl PidFile {
             }
         }
         // A filesystem that cannot lock is not worth refusing to start over: the
-        // socket probe below still catches the ordinary case, and this is the
-        // same trade as a signal handler that fails to register.
+        // socket probe below still catches the ordinary case.
         eprintln!(
             "[WARN] Failed to lock {}: {error}; a concurrent `agent start` will not be detected",
             path.display()
@@ -138,12 +134,12 @@ impl PidFile {
     }
 }
 
-/// Take over the agent's files and socket, in the one order that is safe.
+/// Take over the agent's files and socket, in the one order that is safe — kept
+/// in one function rather than strung through `run`.
 ///
 /// The guard comes back with the listener because the two belong to the same
-/// claim: whoever holds the guard is the agent, and dropping it is what removes
-/// both files. Every step here has to happen before the caller can serve, which
-/// is why the ordering lives in one function rather than strung through `run`.
+/// claim: whoever holds the guard is the agent, and dropping it removes both
+/// files.
 async fn take_over(
     paths: &super::AgentPaths,
     mode: SocketMode,
@@ -156,8 +152,7 @@ async fn take_over(
     cleanup_stale(paths).await?;
     // Before the bind, not after: claiming the pid file created it, so from here
     // on a failure has a file to take with it. `cleanup_stale` has already
-    // unlinked any leftover socket, so there is never one of someone else's for
-    // this guard to remove.
+    // unlinked any leftover socket, so this guard never removes someone else's.
     let files = AgentFiles::new(paths, pid_file);
     let listener = bind_socket(&paths.socket, mode)?;
     files.write_pid()?;
@@ -169,10 +164,10 @@ pub async fn run(
     settings: &Settings,
     paths: &super::AgentPaths,
 ) -> Result<()> {
-    // Register before creating anything, so no window exists where a signal
+    // Registered before anything is created, so no window exists where a signal
     // still has its default disposition and kills the process between the bind
-    // and the guard below. Nothing polls these until the connect, which is fine:
-    // a signal arriving earlier is queued rather than lost.
+    // and the guard below. One arriving before anything polls these is queued
+    // rather than lost.
     let mut signals = Shutdown::new();
 
     // Bound for the whole of `run`: the guard's `Drop` is what takes the socket
@@ -204,24 +199,22 @@ pub async fn run(
         }
     };
 
-    // The link is up before anything has been read from it, so record it here:
-    // otherwise an agent sitting idle with a healthy connection — nobody
-    // streaming, no endpoint polling — would report itself as disconnected until
-    // the first measurement.
+    // Recorded before anything has been read: otherwise an agent sitting idle
+    // with a healthy connection — nobody streaming, no endpoint polling — would
+    // report itself disconnected until the first measurement.
     stats.set_connected(true);
 
-    // The endpoint has something to serve now. Started here
-    // rather than at bind time so a scrape landing during the connect is
-    // refused outright instead of being answered with `up 0` from an agent that
-    // has not finished starting.
+    // Started only now that there is something to serve, so a scrape landing
+    // during the connect is refused outright rather than answered with `up 0`
+    // by an agent that has not finished starting.
     let metrics_task =
         metrics.map(|listener| tokio::spawn(super::metrics::serve(listener, Arc::clone(&stats))));
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ActorCommand>();
     // Two separate signals rather than one: the accept loop must stop first so
-    // the actor can finish in-flight work, and `notify_one` leaves a permit
-    // behind when the target is momentarily not parked on `notified()`, which
-    // a shared `notify_waiters` would drop on the floor.
+    // the actor can finish in-flight work. `notify_one` also leaves a permit
+    // behind when the target is momentarily not parked on `notified()`, which a
+    // shared `notify_waiters` would drop on the floor.
     let shutdown = Arc::new(Notify::new());
     let actor_shutdown = Arc::new(Notify::new());
 
@@ -230,8 +223,8 @@ pub async fn run(
         stats: Arc::clone(&stats),
     });
     // A serving endpoint keeps the device polled even with no client attached:
-    // an exporter that only sampled while someone watched would serve nothing to
-    // the scraper it exists for.
+    // an exporter that only sampled while someone watched would have nothing to
+    // serve the scraper it exists for.
     let poll_always = metrics_task.is_some();
 
     let mut actor = tokio::spawn(actor_loop(
@@ -255,8 +248,8 @@ pub async fn run(
     if let Some(task) = metrics_task {
         task.abort();
     }
-    // Reached only after the agent actually served, so a startup failure no
-    // longer reports a clean stop on its way out.
+    // Reached only after the agent actually served, so a startup failure does
+    // not report a clean stop on its way out.
     eprintln!("[INFO] Agent stopped");
     result
 }
@@ -314,10 +307,9 @@ impl Shutdown {
 /// left behind when it is not.
 ///
 /// The pid file claim has already ruled out another agent that takes it. A socket
-/// that answers is what catches the one case it cannot: an agent from before the
-/// claim existed, still holding the device across an upgrade in place. Skipping
-/// that check would let this agent unlink a live one's socket and fight it for
-/// the device.
+/// that answers catches the one case it cannot: an agent from before the claim
+/// existed, still holding the device across an upgrade in place. Without this,
+/// that agent's socket would be unlinked and the two would fight for the device.
 async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
     if super::probe_daemon(paths).await.is_some() {
         bail!("agent is already running");
@@ -333,16 +325,10 @@ async fn cleanup_stale(paths: &super::AgentPaths) -> Result<()> {
 /// exists.
 ///
 /// Both halves are needed. `bind` derives the mode from the umask, so a `chmod`
-/// on its own would leave a window — brief, but a window all the same — in which
-/// the socket is reachable at whatever the inherited umask happened to allow;
-/// narrowing the umask first closes it. The `chmod` is then what makes the mode
-/// exactly the one asked for rather than at most it, since a umask can only
-/// clear bits from whatever `bind` starts out with.
-///
-/// Note that reaching a socket also takes search permission on every directory
-/// above it. The default runtime directory is 0700, so widening the socket alone
-/// does not open it up — the directory has to allow it too, which is what
-/// `RuntimeDirectoryMode` or a pre-created directory is for.
+/// on its own would leave a window in which the socket is reachable at whatever
+/// the inherited umask allowed; narrowing the umask first closes it. The `chmod`
+/// then makes the mode exactly the one asked for rather than at most it, since a
+/// umask can only clear bits.
 fn bind_socket(sock: &Path, mode: SocketMode) -> Result<UnixListener> {
     let listener = {
         let _umask = Umask::narrowed_to(mode);
@@ -355,10 +341,10 @@ fn bind_socket(sock: &Path, mode: SocketMode) -> Result<UnixListener> {
 
 /// The process umask, restored when the guard drops.
 ///
-/// Process-wide, and so only safe to touch because agent startup is the one
-/// thing creating files at this point: the runtime directory and the pid file
-/// are already in place, and the tasks that could race with it are not spawned
-/// until the socket is bound.
+/// Process-wide, and so only safe to touch because nothing else is creating
+/// files at this point: the runtime directory and the pid file are already in
+/// place, and no task that could race with it is spawned until the socket is
+/// bound.
 struct Umask(libc::mode_t);
 
 impl Umask {
@@ -493,10 +479,9 @@ fn control_response(request: &Request, actor_gone: bool, info: &AgentInfo) -> Op
         Request::Ping if actor_gone => Some(Response::Error {
             message: "agent actor is not running".to_string(),
         }),
-        // The address rides along on the pong so a client can tell whether the
-        // agent it found is holding the device its --addr asked for; the status
-        // is read from shared counters, which is why answering here does not
-        // mean answering with less.
+        // The address rides along so a client can tell whether the agent it
+        // found holds the device its --addr asked for; the status comes from
+        // shared counters, so answering here costs nothing.
         Request::Ping => Some(Response::Pong {
             addr: Some(info.addr.to_string()),
             status: Some(info.stats.snapshot()),
@@ -510,12 +495,11 @@ fn control_response(request: &Request, actor_gone: bool, info: &AgentInfo) -> Op
 /// dropped and the link re-established on the next request.
 type StreamError = String;
 
-/// The clients currently streaming measurements.
+/// The clients currently streaming measurements. The device is polled once per
+/// interval whatever the audience, so a second subscriber costs nothing.
 ///
-/// A list rather than the single slot this used to be: the device is polled once
-/// per interval whatever the audience, so a second subscriber costs nothing and
-/// no longer has to be turned away. Owning the reported count alongside the list
-/// is what keeps `agent status` from drifting out of step with it.
+/// Owns the reported count alongside the list, which is what keeps
+/// `agent status` from drifting out of step with it.
 struct Clients {
     list: Vec<mpsc::Sender<Response>>,
     stats: Arc<AgentStats>,
@@ -549,10 +533,9 @@ impl Clients {
             Ok(()) => true,
             // Hung up.
             Err(mpsc::error::TrySendError::Closed(_)) => false,
-            // Still connected, but no longer reading its socket. Waiting for it
-            // would hold samples for a client that may never read again, and
-            // holding them is what an unbounded queue did; dropping it closes the
-            // socket, which is how it learns its feed ended.
+            // Still connected, but no longer reading its socket. Waiting would
+            // hold samples for a client that may never read again; dropping it
+            // closes the socket, which is how it learns its feed ended.
             Err(mpsc::error::TrySendError::Full(_)) => {
                 lagging += 1;
                 false
@@ -580,8 +563,8 @@ impl Clients {
     }
 
     /// Report a failure to everyone and forget them. Best-effort: a client whose
-    /// queue is full has stopped reading, and dropping its sender tells it the
-    /// same thing the message would have.
+    /// queue is full has stopped reading, and dropping its sender tells it as
+    /// much anyway.
     fn abort(&mut self, reason: &StreamError) {
         for tx in self.take() {
             tx.try_send(Response::Error {
@@ -619,8 +602,8 @@ enum Event {
 }
 
 /// Owns the single BLE connection and serializes every client request onto it.
-/// Any number of clients stream measurements at once, all fed from the same poll;
-/// one-shot commands are interleaved on the same link.
+/// Any number of clients stream at once, all fed from the same poll, with
+/// one-shot commands interleaved on the same link.
 struct Actor {
     conn: Connection,
     notifications: Option<Notifications>,
@@ -641,7 +624,7 @@ async fn actor_loop(
     stats: Arc<AgentStats>,
     poll_always: bool,
 ) {
-    // With the endpoint serving, nothing will ever ask for a subscription, so
+    // With the endpoint serving, nothing may ever ask for a subscription, so
     // the actor polls on its own from the first tick — which `interval` fires
     // straight away, and which takes the subscription out itself.
     let mut actor = Actor::new(conn, stats, poll_always);
@@ -698,9 +681,8 @@ impl Actor {
         let mut ticker = tokio::time::interval(conn.interval());
         // A poll that overruns its period — a write that retries through a
         // reconnect, say — must not leave a backlog of ticks to fire
-        // back-to-back afterwards. That matters more now the agent polls
-        // unattended for the metrics endpoint: the default burst behaviour would
-        // answer a minute of failed writes with a minute of instant retries.
+        // back-to-back. The default would answer a minute of failed writes with
+        // a minute of instant retries, unattended when the endpoint is serving.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Self {
             conn,
@@ -741,8 +723,7 @@ impl Actor {
     }
 
     /// Tear the streaming state down and report the failure to every client.
-    /// Every path that gives up on streaming goes through here, so what "torn
-    /// down" means stays in one place.
+    /// Every path that gives up on streaming goes through here.
     fn abort_stream(&mut self, reason: StreamError) {
         eprintln!("[ERR] {reason}");
         self.notifications = None;
@@ -757,13 +738,10 @@ impl Actor {
             return;
         }
 
-        // An aborted stream leaves no subscription behind. Nobody else will take
-        // one out when the endpoint is what keeps the polling going, so recover
-        // here rather than waiting for a client that may never arrive.
-        //
-        // Routed through `abort_stream` rather than just logged, so a link this
-        // agent cannot subscribe to is not still reported as connected by
-        // `agent status` — which is the one thing that field exists to say.
+        // An aborted stream leaves no subscription behind, and when the endpoint
+        // is what keeps the polling going nobody else will take one out. Routed
+        // through `abort_stream` rather than just logged, so a link this agent
+        // cannot subscribe to is not still reported as connected.
         if self.notifications.is_none()
             && let Err(e) = self.relisten().await
         {
@@ -791,8 +769,8 @@ impl Actor {
                     self.stats.record_reconnect();
                     self.apply_subscription(n);
                 }
-                // `reconnect_stream` already logged the "[WARN] ... reconnecting"
-                // line; surface the fatal failure and tear the stream down.
+                // `reconnect_stream` already logged the attempt; this is the
+                // fatal failure after it.
                 Err(e) => self.abort_stream(format!("reconnect failed: {e}")),
             }
             return;
@@ -812,8 +790,8 @@ impl Actor {
             let Some(m) = connection::try_measurement(&frame) else {
                 continue;
             };
-            // Recorded even with no client attached: this is what the metrics
-            // endpoint serves, and what `agent status` counts.
+            // Recorded even with no client attached: the metrics endpoint serves
+            // this, and `agent status` counts it.
             stats.record_sample(&m);
             clients.broadcast(&Response::from_measurement(&m));
         }
@@ -873,7 +851,7 @@ impl Actor {
 
             // Both the parse and the frame can reject the time — the wire format
             // carries the year in a single byte — and either way the client is
-            // owed the reason rather than a command that sets the wrong clock.
+            // owed the reason rather than a wrongly set clock.
             Request::SetRtc { time } => {
                 let frame = chrono::DateTime::parse_from_rfc3339(&time)
                     .map_err(|e| format!("invalid time: {e}"))
@@ -934,18 +912,16 @@ impl Actor {
     }
 
     /// Read notifications until one reassembles into a frame of the expected
-    /// kind. Measurement and command replies are told apart by length, since a
-    /// streaming measurement can arrive while a one-shot command is in flight;
-    /// those are forwarded to the streaming client rather than dropped.
+    /// kind. A streaming measurement can arrive while a one-shot command is in
+    /// flight, so those are forwarded to the clients rather than dropped.
     ///
-    /// This shares `self.assembler` rather than using a local one on purpose. A
-    /// second assembler would split a part-received frame across the two, and
-    /// both halves would then have to resynchronize on CRC failures — a burst
-    /// of warnings and dropped samples every time a command interrupts a
-    /// stream.
+    /// Shares `self.assembler` on purpose: a second one would split a
+    /// part-received frame across the two, leaving both halves to resynchronize
+    /// on CRC failures — a burst of warnings and dropped samples every time a
+    /// command interrupts a stream.
     async fn wait_for_frame(&mut self, kind: FrameKind) -> Result<Vec<u8>, StreamError> {
-        // Destructured so the three fields can be borrowed independently: the
-        // stream and assembler mutably, the client for the forwarding closure.
+        // Destructured so the fields can be borrowed independently: the stream
+        // and assembler mutably, the clients for the forwarding closure.
         let Self {
             notifications,
             assembler,
@@ -960,8 +936,6 @@ impl Actor {
         let wait = connection::next_matching_frame(notifications, assembler, &kind, |frame| {
             if let Some(m) = connection::try_measurement(frame) {
                 stats.record_sample(&m);
-                // A hung-up client is reaped on the next request; here the
-                // command reply is what matters.
                 clients.broadcast(&Response::from_measurement(&m));
             }
         });
@@ -1021,8 +995,7 @@ mod tests {
         Response::from_measurement(&crate::connection::testutil::measurement(wattage))
     }
 
-    /// The point of the client list: one poll of the device feeds everyone, so
-    /// concurrent subscribers no longer have to be turned away.
+    /// The point of the client list: one poll of the device feeds everyone.
     #[test]
     fn every_client_gets_every_measurement() {
         let stats = test_stats();
@@ -1061,8 +1034,8 @@ mod tests {
         assert!(!clients.is_empty());
     }
 
-    /// The bound is the point: a client that stops reading is dropped rather than
-    /// queued for without limit, and the others carry on unaffected.
+    /// A client that stops reading is dropped rather than queued for without
+    /// limit, and the others carry on unaffected.
     #[test]
     fn a_client_that_stops_reading_is_dropped_not_queued_for() {
         let stats = test_stats();
@@ -1128,8 +1101,8 @@ mod tests {
         assert_eq!(stats.snapshot().clients, 0);
     }
 
-    /// `agent status` reads its answer from the shared counters, which is what
-    /// lets the connection handler reply while the actor is busy on the link.
+    /// The shared counters are what let the connection handler answer while the
+    /// actor is busy on the link.
     #[test]
     fn a_ping_carries_the_address_and_status() {
         let addr: BDAddr = "CB:DF:6B:12:34:56".parse().unwrap();
@@ -1151,8 +1124,8 @@ mod tests {
         assert_eq!(status.clients, 2);
         assert!(!status.connected, "no link has been established yet");
 
-        // With the actor gone there is nothing to report about, so the ping
-        // becomes an error rather than a pong that looks healthy.
+        // With the actor gone the ping becomes an error rather than a pong that
+        // looks healthy.
         assert!(matches!(
             control_response(&Request::Ping, true, &info),
             Some(Response::Error { .. })
@@ -1206,10 +1179,9 @@ mod tests {
     }
 
     /// The pid file is a claim rather than a note: while one agent holds it, no
-    /// second agent may start, whatever the file happens to contain. This is what
-    /// two `agent start`s racing each other come down to — without it both read
-    /// the file, both conclude nothing is running, and both unlink the other's
-    /// socket.
+    /// second agent may start, whatever the file happens to contain. Without
+    /// that, two `agent start`s racing each other both read the file, both
+    /// conclude nothing is running, and both unlink the other's socket.
     #[test]
     fn the_pid_file_is_an_exclusive_claim() {
         let temp = TempPath::new(".pid");
@@ -1274,9 +1246,7 @@ mod tests {
 
     /// A bind takes its mode from the umask, which an agent holding a mains
     /// switch must not depend on. A configured mode is carried exactly as
-    /// written, since letting other users in is a choice the operator is
-    /// allowed to make — and it is never wider than that in between, which is
-    /// what binding under a narrowed umask buys.
+    /// written, and — thanks to the narrowed umask — never wider in between.
     #[tokio::test]
     async fn the_socket_is_bound_at_the_configured_mode() {
         for text in ["0600", "0660", "0666"] {

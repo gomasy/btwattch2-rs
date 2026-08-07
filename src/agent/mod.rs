@@ -11,15 +11,13 @@ use btleplug::api::BDAddr;
 
 /// How long an accept loop waits after a failed `accept`. Running out of
 /// descriptors fails instantly and for as long as the shortage lasts, so an
-/// unpaused loop would spin at the speed of its own log writes. Shared by both
-/// listeners, since neither has a reason to pick a different number.
+/// unpaused loop would spin at the speed of its own log writes.
 pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Fallback runtime directory when `$XDG_RUNTIME_DIR` is unset. The agent needs
-/// raw BLE access and so runs as root; `/run` is root-owned and lives on a
-/// tmpfs that is cleared on boot, unlike the world-writable `/tmp` this used to
-/// fall back to, where any local user could squat the socket or pre-create the
-/// pid file as a symlink. The agent creates it 0700 on first start.
+/// Fallback runtime directory when `$XDG_RUNTIME_DIR` is unset. Root-owned and
+/// on a tmpfs cleared at boot, unlike a world-writable `/tmp` where any local
+/// user could squat the socket or pre-create the pid file as a symlink. The
+/// agent creates it 0700 on first start.
 const RUNTIME_FALLBACK: &str = "/run/btwattch2";
 
 /// Where the agent daemon keeps its IPC socket and pid file.
@@ -35,9 +33,8 @@ impl AgentPaths {
         socket.with_extension("pid")
     }
 
-    /// The pid the agent recorded, if the file holds one. A file that is
-    /// missing, empty, or not a number all mean the same thing to every caller:
-    /// there is no pid to go on.
+    /// The pid the agent recorded, if the file holds one. Missing, empty, and
+    /// unparsable all mean the same thing: there is no pid to go on.
     pub fn read_pid(&self) -> Option<u32> {
         std::fs::read_to_string(&self.pid).ok()?.trim().parse().ok()
     }
@@ -56,8 +53,7 @@ pub fn default_paths() -> AgentPaths {
     paths_from_socket(runtime_dir().join("btwattch2.sock"))
 }
 
-/// Build paths from an explicit socket location, deriving the pid file by
-/// extension so the two stay co-located.
+/// Build paths from an explicit socket location.
 pub fn paths_from_socket(socket: PathBuf) -> AgentPaths {
     let pid = AgentPaths::pid_for(&socket);
     AgentPaths { socket, pid }
@@ -88,8 +84,7 @@ pub async fn probe_daemon(paths: &AgentPaths) -> Option<DaemonInfo> {
     client::ping(paths).await.ok()
 }
 
-/// Temp paths and cleanup shared by this module's test suites, so `client` and
-/// `server` do not each invent a naming scheme and hand-rolled teardown.
+/// Temp paths and cleanup shared by this module's test suites.
 #[cfg(test)]
 pub mod testutil {
     use std::path::{Path, PathBuf};
@@ -98,9 +93,8 @@ pub mod testutil {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
     /// A unique path under the temp dir, removed when the guard drops —
-    /// including on a failing assert, which manual cleanup at the end of a test
-    /// would skip. Names stay short because a unix socket path is capped at
-    /// roughly 100 bytes.
+    /// including on a failing assert. Names stay short because a unix socket
+    /// path is capped at roughly 100 bytes.
     pub struct TempPath(PathBuf);
 
     impl TempPath {

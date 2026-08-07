@@ -29,8 +29,8 @@ pub async fn execute(
         let resp: Response =
             serde_json::from_str(line.trim()).context("failed to parse agent response")?;
 
-        // An error reply is the agent reporting the request failed, so it
-        // becomes this call's error rather than something to hand onward.
+        // The agent reporting the request failed, so it becomes this call's
+        // error rather than something to hand onward.
         if let Response::Error { message } = resp {
             bail!(message);
         }
