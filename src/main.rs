@@ -22,9 +22,8 @@ use signal::Sigpipe;
 
 const DEFAULT_SCAN_WINDOW: Duration = Duration::from_secs(10);
 
-/// Parse the command line, then hand off to the runtime. Kept synchronous so
-/// the SIGPIPE decision lands before any thread is spawned, which is what makes
-/// `set_sigpipe` safe to call at all.
+/// Kept synchronous so the SIGPIPE decision lands before any thread is spawned,
+/// which is what makes `set_sigpipe` safe to call at all.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     signal::set_sigpipe(if cli.is_agent_start() {
@@ -40,9 +39,8 @@ fn main() -> Result<()> {
 }
 
 async fn run_cli(cli: Cli) -> Result<()> {
-    // Resolves the config file and the profile `--device` selects, so every
-    // path below — including `agent stop` finding the right socket — agrees on
-    // what device this invocation is about.
+    // Resolved once, so every path below — including `agent stop` finding the
+    // right socket — agrees on what device this invocation is about.
     let settings = cli.settings()?;
     let paths = cli.agent_paths(&settings);
 
@@ -53,8 +51,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
     let mode = cli.mode();
     cli.validate_prefix(&mode)?;
 
-    // Stay quiet in Mackerel mode unless --debug is given, so nothing but
-    // metrics reaches mackerel-agent.
+    // Quiet in Mackerel mode unless --debug, so nothing but metrics reaches
+    // mackerel-agent.
     let log_level = cli.log_level(matches!(mode, Mode::Metric(_)));
     connection::set_log_level(log_level);
 
@@ -87,8 +85,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
 /// Stop before handing a command to an agent attached to some other device.
 /// Routing is automatic, so without this check `--addr <B>` while an agent
-/// holds device A quietly operates A instead — on a mains switch that is not a
-/// mistake worth making twice.
+/// holds device A quietly operates A instead.
 fn ensure_addr_matches(cli: &Cli, daemon: &agent::DaemonInfo, socket: &Path) -> Result<()> {
     let (Some(want), Some(have)) = (cli.explicit_addr(), daemon.addr) else {
         return Ok(());
@@ -144,9 +141,8 @@ async fn run_agent_command(
         AgentAction::Status => {
             match agent::probe_daemon(paths).await {
                 Some(daemon) => print_daemon(&daemon, paths),
-                // Name the socket: with a profile per device there are several
-                // an invocation could have meant, and which one was checked is
-                // the first question when the answer is "not running".
+                // Name the socket: with a profile per device, which one was
+                // checked is the first question when the answer is "not running".
                 None => println!("Agent is not running ({})", paths.socket.display()),
             }
             Ok(())
@@ -156,7 +152,7 @@ async fn run_agent_command(
 
 /// Report a live agent: who it is, where it listens, and what it says about
 /// itself. The socket answered, so the agent is up even when its pid file is
-/// missing or unreadable — say so rather than print a blank.
+/// missing or unreadable.
 fn print_daemon(daemon: &agent::DaemonInfo, paths: &agent::AgentPaths) {
     match paths.read_pid() {
         Some(pid) => println!("Agent is running (pid {pid})"),
@@ -216,11 +212,11 @@ async fn run_via_daemon(
 /// Report what the agent says about itself. Printed only when the agent sent a
 /// status at all, so an older daemon still gets its pid and address reported.
 fn print_agent_status(status: &agent::protocol::AgentStatus) {
+    // A running agent whose link has dropped is the state worth naming: it
+    // answers commands, and every one of them fails until it recovers.
     let link = if status.connected {
         "connected"
     } else {
-        // A running agent whose link has dropped is the state worth naming: it
-        // answers commands, and every one of them will fail until it recovers.
         "disconnected"
     };
     println!("Link:        {link}");
@@ -241,9 +237,8 @@ fn print_agent_status(status: &agent::protocol::AgentStatus) {
     }
 }
 
-/// A duration in seconds, in the spelling `--interval` accepts — the same
-/// rendering `Interval` itself uses, which is `Duration`'s. Rounded to
-/// milliseconds first, so a float a hair off a round number does not come out as
+/// A duration in the spelling `--interval` accepts. Rounded to milliseconds
+/// first, so a float a hair off a round number does not come out as
 /// `899.999999ms`.
 fn format_seconds(seconds: f64) -> String {
     let millis = (seconds * 1000.0).round().max(0.0) as u64;
@@ -269,9 +264,9 @@ fn print_rtc_drift(m: &Measurement) {
     println!("drift_seconds = {}", drift.num_seconds());
 }
 
-/// The renderer a streaming run prints through. Built identically whether the
-/// samples come straight off the BLE link or by way of an agent, so the two
-/// paths cannot drift apart on format, sample count, or the closing summary.
+/// The renderer a streaming run prints through. Built here for both the direct
+/// BLE path and the agent-relayed one, so the two cannot drift apart on format,
+/// sample count, or the closing summary.
 fn renderer(cli: &Cli, mode: &Mode, log_level: LogLevel) -> StreamRenderer {
     StreamRenderer::new(
         cli.output_format(),
@@ -342,8 +337,8 @@ fn print_scan(devices: &[ScannedDevice], mode: ScanMode) {
     }
 
     // Say what was left out, so a meter whose name never arrived does not look
-    // like a meter that is not there. Informational, so `--quiet` drops it and
-    // the device list stays the only thing on stdout either way.
+    // like a meter that is not there. On stderr, so the device list stays the
+    // only thing on stdout.
     let hidden = devices.len() - listed.len();
     if hidden > 0 && connection::info_enabled() {
         eprintln!("[INFO] {hidden} other device(s) hidden; use --scan-all to list them");

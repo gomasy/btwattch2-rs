@@ -14,35 +14,28 @@ pub const DEFAULT_INDEX: usize = 0;
 pub const DEFAULT_INTERVAL: Interval = Interval(Duration::from_secs(1));
 
 /// The agent socket's mode when the config file does not set one: its owner
-/// alone, as the pid file beside it. `bind` would otherwise take its mode from
-/// the inherited umask, which is not something an agent that switches mains
-/// power should rest on — connecting to a unix socket takes write permission on
-/// it. Widen it with `socket_mode` when other users are meant to reach the agent.
+/// alone, as the pid file beside it. Otherwise `bind` takes the mode from the
+/// inherited umask, which an agent holding a mains switch should not rest on —
+/// connecting to a unix socket takes write permission on it.
 pub const DEFAULT_SOCKET_MODE: SocketMode = SocketMode(0o600);
 
-/// Shortest polling period accepted. The device answers a measurement request
-/// over BLE, and below a few milliseconds the requests only queue up behind
-/// replies that cannot arrive any faster — so the floor is a guard against a
-/// value that would look like it worked while merely flooding the link.
+/// Shortest polling period accepted. Below a few milliseconds the requests only
+/// queue up behind replies that cannot arrive any faster, so the floor guards
+/// against a value that merely floods the link.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Longest polling period accepted. Nothing about the device argues for a
-/// particular ceiling; this one exists so the value stays a duration arithmetic
-/// can be done on. `AgentStats` derives its freshness window by multiplying the
-/// interval, and `Duration`'s multiplication panics on overflow — which
-/// `try_from_secs_f64` alone leaves reachable, since it accepts durations within
-/// a factor of two of `Duration::MAX`. A day is far beyond any interval worth
-/// polling a power meter at.
+/// particular ceiling; this one keeps the value a duration arithmetic can be
+/// done on, since `AgentStats` multiplies the interval to derive its freshness
+/// window and `Duration`'s multiplication panics on overflow.
 const MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long to wait between measurement requests.
 ///
-/// A newtype rather than a `Duration`, so "positive, and neither absurdly small
-/// nor absurdly large" is established once at parse time: the value becomes a
-/// `tokio::time::interval` period, which panics on a zero duration, and gets
-/// multiplied to derive the agent's freshness window, which panics on overflow.
-/// The lower bound used to be carried by `NonZeroU64` seconds, which also ruled
-/// out every sub-second period.
+/// A newtype rather than a `Duration`, so the bounds above are established once
+/// at parse time: the value becomes a `tokio::time::interval` period, which
+/// panics on a zero duration, and is multiplied to derive the agent's freshness
+/// window, which panics on overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interval(Duration);
 
@@ -59,11 +52,9 @@ impl Interval {
 impl FromStr for Interval {
     type Err = anyhow::Error;
 
-    /// Accepts seconds (`1`, `0.5`, `2s`) or milliseconds (`500ms`).
-    ///
-    /// The message says what was wrong with the value, not what the value was:
-    /// both callers — clap and the config file parser — already name it, and
-    /// naming it again reads as a stutter.
+    /// Accepts seconds (`1`, `0.5`, `2s`) or milliseconds (`500ms`). The errors
+    /// say what was wrong with the value, not what it was: both callers — clap
+    /// and the config file parser — already name it.
     fn from_str(s: &str) -> Result<Self> {
         let text = s.trim();
         // `ms` first: `strip_suffix('s')` would otherwise leave a trailing `m`.
@@ -88,8 +79,8 @@ impl FromStr for Interval {
     }
 }
 
-/// `Duration`'s own `Debug` is the format wanted here — `1s`, `500ms`, `1.5s` —
-/// and it round-trips through `FromStr` above.
+/// `Duration`'s own `Debug` — `1s`, `500ms`, `1.5s` — which round-trips through
+/// `FromStr` above.
 impl fmt::Display for Interval {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.0)
@@ -100,12 +91,9 @@ fn parse_interval(s: &str) -> Result<Interval> {
     s.parse()
 }
 
-/// The permission bits the agent creates its socket with.
-///
-/// A newtype rather than a bare `u32`, so "octal, and nothing beyond the
-/// permission bits" is settled at parse time — the same job `Interval` does for
-/// a duration. It also keeps the spelling octal in both directions, so a value
-/// read back reads as the one that was written.
+/// The permission bits the agent creates its socket with. A newtype rather than
+/// a bare `u32`, so "octal, and nothing beyond the permission bits" is settled
+/// at parse time and stays octal in both directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketMode(u32);
 
@@ -121,9 +109,6 @@ impl FromStr for SocketMode {
     /// Always octal, with or without the customary leading zero. Never decimal:
     /// `600` is how `chmod` and every mode anyone writes down is read, so taking
     /// it as decimal would quietly apply something else entirely.
-    ///
-    /// As with `Interval`, the message describes what is wrong rather than
-    /// repeating the value its caller has already named.
     fn from_str(s: &str) -> Result<Self> {
         let bits = u32::from_str_radix(s.trim(), 8)
             .map_err(|_| anyhow!("expected octal permission bits, e.g. 0600 or 0666"))?;
@@ -160,9 +145,8 @@ pub enum OutputFormat {
 }
 
 /// Characters a Prometheus metric name may contain. `parse_metric_name` accepts
-/// this set plus `.` and `-` for Mackerel's benefit, so keeping the narrow set
-/// in one predicate is what makes the subset relation between the two real
-/// rather than a claim in a doc comment.
+/// this set plus `.` and `-` for Mackerel's benefit; sharing the predicate is
+/// what makes the subset relation between the two real.
 fn prometheus_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | ':')
 }
@@ -223,10 +207,9 @@ impl ConnectOpts {
 /// Everything one device needs: how to reach it, and where the agent holding it
 /// keeps its socket and metrics endpoint.
 ///
-/// One type for three roles, because they have the same shape and the same
-/// merge rule: a `[devices.*]` section, the config file's own top-level keys,
-/// and what an invocation finally runs with once the command line has been
-/// overlaid on both.
+/// One type for three roles, since they share a shape and a merge rule: a
+/// `[devices.*]` section, the config file's top-level keys, and what an
+/// invocation finally runs with once the command line is overlaid on both.
 #[derive(Clone, Debug, Default)]
 pub struct Settings {
     pub connect: ConnectOpts,
@@ -238,9 +221,9 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Overlay `self` on `fallback`: any field set here wins. Used twice, with
-    /// the same meaning both times — a `[devices.*]` section over the file's
-    /// top-level keys, then the command line over the result.
+    /// Overlay `self` on `fallback`: any field set here wins. Used for a
+    /// `[devices.*]` section over the file's top-level keys, then for the
+    /// command line over the result.
     fn or(&self, fallback: &Settings) -> Settings {
         Settings {
             connect: self.connect.or(&fallback.connect),
@@ -255,8 +238,7 @@ impl Settings {
         self.socket_mode.unwrap_or(DEFAULT_SOCKET_MODE)
     }
 
-    /// Adapter index to use. Shared by the scan path (which needs no address)
-    /// and `connection_config`.
+    /// Adapter index to use. Also serves the scan path, which needs no address.
     pub fn adapter_index(&self) -> usize {
         self.connect.index.unwrap_or(DEFAULT_INDEX)
     }
@@ -279,9 +261,9 @@ impl Settings {
 pub struct ConnectionConfig {
     pub index: usize,
     pub addr: BDAddr,
-    /// Positive by construction: it becomes a `tokio::time::interval` period,
-    /// which panics on a zero duration. Enforcing it in the type keeps that out
-    /// of reach instead of resting on the two parsers that feed this struct.
+    /// Positive by construction, rather than by trusting the two parsers that
+    /// feed this struct: it becomes a `tokio::time::interval` period, which
+    /// panics on a zero duration.
     pub interval: Interval,
 }
 
@@ -450,8 +432,7 @@ pub enum ScanMode {
 }
 
 /// What the invocation asks the tool to do, the scans aside (main handles those
-/// before connecting). The clap `mode` group guarantees at most one of the
-/// flags below is set.
+/// before connecting). The clap `mode` group guarantees at most one is set.
 #[derive(Debug)]
 pub enum Mode {
     SetRtc(DateTime<Local>),
@@ -485,8 +466,8 @@ impl Cli {
     }
 
     /// Whether this invocation only lists nearby devices, and whether it wants
-    /// the unfiltered list. `--scan` names watt checkers alone, as its help says;
-    /// `--scan-all` is the escape hatch for a device whose name has not arrived.
+    /// the unfiltered list — the escape hatch for a device whose name has not
+    /// arrived.
     pub fn scan_mode(&self) -> Option<ScanMode> {
         match (self.scan, self.scan_all) {
             (true, _) => Some(ScanMode::WattCheckers),
@@ -576,8 +557,8 @@ impl Cli {
     }
 
     /// Resolve everything the invocation needs from the command line and the
-    /// config file, the command line winning. Done once per run so the config
-    /// file is read and validated a single time.
+    /// config file, the command line winning. Called once per run, so the file
+    /// is read and validated a single time.
     pub fn settings(&self) -> Result<Settings> {
         let file = self.load_config()?;
         let profile = match (&file, &self.device) {
@@ -625,8 +606,7 @@ impl Cli {
     }
 
     /// Resolve the agent socket/pid paths, honouring `--socket` (or the selected
-    /// profile's) and `--pid-file` if given. The pid file defaults to the socket
-    /// path with a `.pid` extension, which `--pid-file` overrides.
+    /// profile's) and `--pid-file` if given.
     pub fn agent_paths(&self, settings: &Settings) -> crate::agent::AgentPaths {
         let mut paths = match &settings.socket {
             Some(s) => crate::agent::paths_from_socket(s.clone()),
@@ -641,8 +621,7 @@ impl Cli {
 
 /// Parse a config file: `key = value` lines, optionally grouped into
 /// `[devices.NAME]` sections. Keys before the first section are defaults every
-/// section inherits, which is also the whole configuration for a file with no
-/// sections at all — the only shape that existed before profiles.
+/// section inherits, and the whole configuration for a file with no sections.
 fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
     let mut config = FileConfig {
         path,
@@ -702,8 +681,7 @@ fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
 
         let profile = match &section {
             // The header already inserted this entry, so `or_default` never
-            // fires; going back through the entry API rather than unwrapping a
-            // lookup keeps that a property of the code instead of a claim.
+            // fires; the entry API is how that stays true without an unwrap.
             Some(name) => config.devices.entry(name.clone()).or_default(),
             None => &mut config.defaults,
         };
@@ -727,9 +705,8 @@ fn parse_config(text: &str, path: PathBuf) -> Result<FileConfig> {
 /// Apply one `key = value` pair to `profile`. Unknown keys are hard errors, so
 /// a typo cannot silently leave a default in place.
 ///
-/// Every value is a `FromStr` that rejects what it cannot represent — `Interval`
-/// its bounds, `SocketMode` anything but permission bits — so no key needs a
-/// range check here that could drift out of step with the type's own.
+/// Every value is a `FromStr` that rejects what it cannot represent, so no key
+/// needs a range check here that could drift out of step with the type's own.
 fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result<()> {
     match key {
         "index" => profile.connect.index = Some(parse_value(value, key, place)?),
@@ -744,9 +721,8 @@ fn assign(profile: &mut Settings, key: &str, value: &str, place: &str) -> Result
 }
 
 /// Parse one config value, naming the line, the key, and the value it choked
-/// on. One helper rather than a `with_context` per key, so every value in the
-/// file fails the same way — and so a message cannot go missing the line number
-/// that says which file and which line to go and look at.
+/// on. One helper rather than a `with_context` per key, so no message can go
+/// missing the line number that says where to look.
 fn parse_value<T>(value: &str, key: &str, place: &str) -> Result<T>
 where
     T: FromStr,
@@ -758,9 +734,9 @@ where
 }
 
 /// Strip one matching pair of double quotes, so `addr = "..."` and `addr = ...`
-/// both work. `trim_matches` would peel off every quote at both ends, quietly
-/// accepting `""""` and the like; leaving the extras in makes the value fail to
-/// parse with an error naming the line, which is the point of this parser.
+/// both work. Not `trim_matches`, which would peel off every quote at both ends
+/// and quietly accept `""""`; leaving the extras in makes the value fail to
+/// parse with an error naming the line.
 fn unquote(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -768,11 +744,11 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// Accept only metric names every supported backend can carry: the union of
-/// what each accepts, which is `prometheus_char` plus `.` and `-` for
-/// Mackerel. `OutputFormat::validate_prefix` narrows it again per format.
-/// Rejecting the rest also keeps a name containing a newline or a tab from
-/// forging extra metric lines in the line-oriented formats.
+/// Accept only metric names every supported backend can carry: `prometheus_char`
+/// plus `.` and `-` for Mackerel, narrowed again per format by
+/// `OutputFormat::validate_prefix`. Rejecting the rest also keeps a name
+/// containing a newline or a tab from forging extra lines in the line-oriented
+/// formats.
 fn parse_metric_name(s: &str) -> Result<String> {
     let mut chars = s.chars();
     let head = chars
@@ -827,11 +803,9 @@ fn parse_time(s: &str) -> Result<DateTime<Local>> {
             .ok_or_else(|| anyhow!("unrecognized time format: {s}"))?,
     };
 
-    // A year the device cannot store is rejected here, before anything connects,
-    // for the same reason `validate_prefix` is: waiting through a BLE connect to
-    // be told the value was never going to work is the wrong order. Checked by
-    // building the real frame, so the range stays with the wire layout rather
-    // than being copied into a second place that can drift.
+    // Rejected before anything connects, rather than after the tens of seconds a
+    // BLE connect can take. Checked by building the real frame, so the range
+    // stays with the wire layout rather than being copied here.
     crate::payload::rtc(&time)?;
     Ok(time)
 }
@@ -899,8 +873,8 @@ mod tests {
         parse_config(text, PathBuf::from("config.toml"))
     }
 
-    /// Resolve `args` against `text` written to a real config file, which is the
-    /// only way through `settings` — it reads the file itself.
+    /// Resolve `args` against `text` written to a real config file, since
+    /// `settings` reads the file itself.
     fn settings(args: &[&str], text: &str) -> Result<Settings> {
         let temp = crate::agent::testutil::TempPath::new(".toml");
         std::fs::write(temp.path(), text).unwrap();
@@ -1054,12 +1028,8 @@ mod tests {
         }
     }
 
-    /// Zero would panic `tokio::time::interval`, and the rest are values that
-    /// would otherwise be silently truncated or accepted as nonsense.
-    ///
-    /// The oversized ones matter for the same reason as zero: `try_from_secs_f64`
-    /// accepts up to `Duration::MAX`, and tripling one of those to derive the
-    /// agent's freshness window panics.
+    /// Zero would panic `tokio::time::interval`; the oversized ones would panic
+    /// the multiplication that derives the agent's freshness window.
     #[test]
     fn interval_rejects_zero_and_junk() {
         for text in [
@@ -1109,8 +1079,8 @@ mod tests {
     }
 
     /// Rejected rather than defaulted: the key is set to widen access, so
-    /// falling back to owner-only would lock out the very users a typo was
-    /// meant to admit. `0o600` is Rust's spelling, not `chmod`'s.
+    /// falling back to owner-only would lock out the users a typo meant to
+    /// admit. `0o600` is Rust's spelling, not `chmod`'s.
     #[test]
     fn socket_mode_rejects_anything_that_is_not_permission_bits() {
         for text in [

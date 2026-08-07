@@ -3,9 +3,8 @@
 /// Rust ignores SIGPIPE at startup, which suits a server but not a CLI: a
 /// closed stdout turns into an EPIPE panic inside `println!`, and under
 /// `panic = "abort"` that is a SIGABRT and a backtrace where every other CLI
-/// exits quietly. Which behaviour is wanted follows from what the process is,
-/// so it is chosen once from the parsed command rather than set and unset as
-/// control moves between modules.
+/// exits quietly. Chosen once from the parsed command, since which behaviour is
+/// wanted follows from what the process is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sigpipe {
     /// Die on a closed pipe, as `head` and friends expect. For the CLI.
