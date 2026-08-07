@@ -138,21 +138,18 @@ impl PidFile {
     }
 }
 
-pub async fn run(
-    config: &ConnectionConfig,
-    settings: &Settings,
+/// Take over the agent's files and socket, in the one order that is safe.
+///
+/// The guard comes back with the listener because the two belong to the same
+/// claim: whoever holds the guard is the agent, and dropping it is what removes
+/// both files. Every step here has to happen before the caller can serve, which
+/// is why the ordering lives in one function rather than strung through `run`.
+async fn take_over(
     paths: &super::AgentPaths,
-) -> Result<()> {
-    let sock = &paths.socket;
-
-    // Register before creating anything, so no window exists where a signal
-    // still has its default disposition and kills the process between the bind
-    // and the guard below. Nothing polls these until the connect, which is fine:
-    // a signal arriving earlier is queued rather than lost.
-    let mut signals = Shutdown::new();
-
+    mode: SocketMode,
+) -> Result<(AgentFiles<'_>, UnixListener)> {
     // The directory first: the pid file the claim below opens lives in it.
-    ensure_socket_dir(sock)?;
+    ensure_socket_dir(&paths.socket)?;
     // Before anything is unlinked, so two agents starting at once cannot each
     // decide the other is not there.
     let pid_file = PidFile::claim(paths)?;
@@ -162,10 +159,27 @@ pub async fn run(
     // unlinked any leftover socket, so there is never one of someone else's for
     // this guard to remove.
     let files = AgentFiles::new(paths, pid_file);
-    let listener = bind_socket(sock, settings.socket_mode())?;
+    let listener = bind_socket(&paths.socket, mode)?;
     files.write_pid()?;
+    Ok((files, listener))
+}
 
-    eprintln!("[INFO] Agent listening on {}", sock.display());
+pub async fn run(
+    config: &ConnectionConfig,
+    settings: &Settings,
+    paths: &super::AgentPaths,
+) -> Result<()> {
+    // Register before creating anything, so no window exists where a signal
+    // still has its default disposition and kills the process between the bind
+    // and the guard below. Nothing polls these until the connect, which is fine:
+    // a signal arriving earlier is queued rather than lost.
+    let mut signals = Shutdown::new();
+
+    // Bound for the whole of `run`: the guard's `Drop` is what takes the socket
+    // and pid file with it, however this returns.
+    let (_files, listener) = take_over(paths, settings.socket_mode()).await?;
+
+    eprintln!("[INFO] Agent listening on {}", paths.socket.display());
 
     // Claimed before the connect: a port already in use should fail now rather
     // than after the tens of seconds a BLE connect can take.
