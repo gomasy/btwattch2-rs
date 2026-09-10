@@ -13,7 +13,7 @@ libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "signal"] }
-uuid = "1.26.0"
+uuid = "1.26.1"
 
 [lints.clippy]
 # A dropped connection or a malformed frame may not be able to take the process
